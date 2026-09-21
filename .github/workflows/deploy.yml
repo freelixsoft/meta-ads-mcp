@@ -188,8 +188,15 @@ jobs:
         id: auth
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093  # v3.0.0
         with:
-          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          # Both values are resource identifiers, not credentials, so they are
+          # pinned here rather than kept as repository secrets. Neither grants
+          # anything on its own: impersonating the deployer requires an OIDC
+          # token this provider accepts, and the provider's attribute condition
+          # admits only freelixsoft/meta-ads-mcp. Google's own documentation
+          # puts the same two values in public workflow files for that reason.
+          # Everything that IS a credential stays in secrets, untouched.
+          workload_identity_provider: projects/639495902805/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: meta-ads-mcp-deployer@meta-ads-mcp-prod-2026.iam.gserviceaccount.com
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db  # v3.0.1
