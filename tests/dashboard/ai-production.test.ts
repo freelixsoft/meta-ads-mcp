@@ -139,7 +139,7 @@ describe("the request that goes on the wire", () => {
     ]);
     // Render order is tools -> system -> messages, so one breakpoint here
     // caches the ~15 tool schemas too.
-    expect(params.tools).toHaveLength(10);
+    expect(params.tools).toHaveLength(11);
   });
 
   it("asks for adaptive thinking at a bounded effort and a bounded output", () => {

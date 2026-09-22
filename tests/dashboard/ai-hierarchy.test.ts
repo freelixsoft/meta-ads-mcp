@@ -629,6 +629,77 @@ describe("A–D: what each request produces", () => {
   });
 });
 
+/**
+ * The diagnosis tool over the real read path: authorization, the two periods,
+ * the children, and the guarantee that none of it writes.
+ */
+describe("meta_diagnose_change over the tool surface", () => {
+  it("diagnoses the account and names the campaign that carries the change", async () => {
+    const result = (await read("meta_diagnose_change", { preset: "last_7d", level: "account" })) as {
+      scope: { level: string };
+      childLevel: string;
+      headline: Record<string, number | null>;
+      contributions: Array<{ objectId: string; objectName: string }>;
+      confidence: string;
+      period: { days: number };
+    };
+
+    expect(result.scope.level).toBe("account");
+    expect(result.childLevel).toBe("campaign");
+    expect(result.headline).toHaveProperty("spend");
+    expect(result.headline).toHaveProperty("spendPrevious");
+    expect(result.headline).toHaveProperty("roasChangePercent");
+    expect(result.period.days).toBe(7);
+    expect(result.contributions.length).toBeGreaterThan(0);
+    // The whole point of this feature: analysis is a read.
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+
+  it("goes one level down and authorizes the scope it was given", async () => {
+    const result = (await read("meta_diagnose_change", {
+      preset: "last_7d",
+      level: "campaign",
+      entityId: "500",
+    })) as { scope: { level: string; id: string | null; name: string }; childLevel: string };
+
+    expect(result.scope).toMatchObject({ level: "campaign", id: "500", name: "SATIŞLAR REKLAMI" });
+    expect(result.childLevel).toBe("adset");
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses a scope in another ad account", async () => {
+    await expect(
+      read("meta_diagnose_change", { preset: "last_7d", level: "campaign", entityId: "900" }),
+    ).rejects.toMatchObject({ code: "account_forbidden" });
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+
+  it("requires an entityId below account level", () => {
+    const tool = READ_TOOLS_BY_NAME.get("meta_diagnose_change");
+    expect(() => tool!.schema.parse({ preset: "last_7d", level: "campaign" })).toThrow();
+  });
+
+  it("lets a Meta rate limit surface instead of returning a half-answer", async () => {
+    metaGetMock.mockRejectedValue(new Error("(#17) User request limit reached"));
+
+    const failure = await read("meta_diagnose_change", {
+      preset: "last_7d",
+      level: "campaign",
+      entityId: "500",
+    }).catch((caught: unknown) => caught as InstanceType<typeof DashboardError>);
+
+    expect(failure.code).toBe("meta_rate_limited");
+    // Not an empty diagnosis the model would read as "nothing changed".
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+
+  it("stages nothing: a diagnosis is not a proposal", async () => {
+    await read("meta_diagnose_change", { preset: "last_7d", level: "account" });
+    // No write tool ran, so nothing can be waiting for approval either.
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("a read that Meta refuses", () => {
   it("surfaces the real reason instead of hiding it", async () => {
     // The production failure verbatim: Meta's application request limit.

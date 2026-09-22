@@ -3,7 +3,7 @@ import { z } from "zod";
 import { metaApiClient } from "../meta/client.js";
 import { DashboardError } from "../dashboard/errors.js";
 import { checkRange, dateRangeShape, entityIdSchema, resolveRange, type ResolvedRange } from "../dashboard/schemas.js";
-import { previousPeriod, resolvePresetDates } from "../dashboard/date-range.js";
+import { dayCount, previousPeriod, resolvePresetDates } from "../dashboard/date-range.js";
 import { toAiMetrics } from "../dashboard/ai/context.js";
 import { sanitizeLabel, sanitizeLine } from "../dashboard/ai/sanitize.js";
 import { listAccessibleAccounts } from "../dashboard/services/accounts.js";
@@ -28,6 +28,7 @@ import {
 } from "../dashboard/services/entity-insights.js";
 import type { CampaignDto, EntityRowDto } from "../dashboard/dto.js";
 import { analyze } from "./decision-engine.js";
+import { diagnose, type ChildPeriods } from "./diagnosis-engine.js";
 import type { ConfirmationField, ToolExecutionContext } from "./types.js";
 
 /**
@@ -59,6 +60,9 @@ const DEFAULT_ROW_LIMIT = 15;
 
 /** Findings returned by the optimization pass, before the answer cuts it to three. */
 const MAX_FINDINGS = 8;
+
+/** Children returned by the diagnosis, highest share of the change first. */
+const MAX_CONTRIBUTIONS = 10;
 const MAX_ROW_LIMIT = 40;
 
 const limitField = z
@@ -507,6 +511,139 @@ export const READ_TOOLS: ReadTool[] = [
           adSetName: finding.adSetName ? sanitizeLabel(finding.adSetName) : null,
         })),
         totalFindings: result.findings.length,
+      };
+    },
+  }),
+
+  readTool({
+    name: "meta_diagnose_change",
+    description:
+      "Why a number moved. Reads one scope and its children for a period AND the previous equivalent period, then returns: the headline metrics with their changes, an exact decomposition of the ROAS move across CPM / CTR / conversion rate / average order value, which children carry how much of the change, and the delivery signals that sit outside that identity (frequency, budget-capped or under-delivering, spend that moved without conversions following). Use it for 'why did sales drop', 'what changed this week', 'where is the problem'. It goes ONE level down: start at account to see which campaign carries it, then call it again on that campaign to see its ad sets, then on that ad set to see its ads. It changes nothing and proposes no write.",
+    schema: z
+      .object({
+        ...rangeFields,
+        level: z
+          .enum(["account", "campaign", "adset"])
+          .default("account")
+          .describe("The scope to diagnose. Its children are the level below it."),
+        entityId: entityIdSchema
+          .optional()
+          .describe("Required unless level is account."),
+      })
+      .superRefine((value, ctx) => {
+        checkRange(value, ctx);
+        if (value.level !== "account" && value.entityId === undefined) {
+          ctx.addIssue({ code: "custom", message: "entityId is required unless level is account" });
+        }
+      }),
+    label: (input) => `Değişim analizi yapıldı (${input.level}, ${input.preset})`,
+    async run(input, tools) {
+      const range = resolveRange(input);
+      const concrete =
+        range.timeRange ?? resolvePresetDates(range.datePreset ?? "last_30d", tools.account.timezone);
+      const before = previousPeriod(concrete);
+      const previousRange: ResolvedRange = {
+        datePreset: null,
+        timeRange: before,
+        label: "custom",
+        since: before.since,
+        until: before.until,
+      };
+
+      const scope =
+        input.level === "account"
+          ? accountEntityRef(tools.account)
+          : input.level === "campaign"
+            ? await authorizeCampaign(tools.ctx, tools.account, input.entityId as string)
+            : await authorizeAdSet(tools.ctx, tools.account, input.entityId as string);
+
+      const childLevel = input.level === "account" ? "campaign" : input.level === "campaign" ? "adset" : "ad";
+
+      // The scope's own two periods come from one call: getEntityInsights with
+      // compare already reads both, and skipping the series keeps it to two
+      // Meta requests rather than four.
+      const insights = await getEntityInsights(tools.ctx, tools.account, scope, range, {
+        compare: true,
+        includeSeries: false,
+      });
+      if (!insights.comparison) {
+        throw new DashboardError(
+          "upstream_error",
+          502,
+          "Meta returned no previous-period figures for this scope, so nothing can be compared. Say that and stop.",
+        );
+      }
+
+      // Children: the same listing functions the drill-down uses, so there is
+      // one Meta client, one cache and one authorization model.
+      // Campaigns come with their metrics already joined, so the account
+      // branch needs no separate listing call; below it the children have to
+      // be listed before their rows can be fetched.
+      const children =
+        input.level === "campaign"
+          ? await listAdSetsOfCampaign(tools.ctx, tools.account, scope)
+          : input.level === "adset"
+            ? await listAdsOfAdSet(tools.ctx, tools.account, scope)
+            : [];
+
+      let currentRows: EntityRowDto[];
+      let previousRows: EntityRowDto[];
+      if (input.level === "account") {
+        const [now, then] = await Promise.all([
+          getCampaignsWithMetrics(tools.ctx, tools.account, range, { status: "ALL" }),
+          getCampaignsWithMetrics(tools.ctx, tools.account, previousRange, { status: "ALL" }),
+        ]);
+        currentRows = now.campaigns.map(campaignRow);
+        previousRows = then.campaigns.map(campaignRow);
+      } else {
+        const refs = children;
+        const [now, then] = await Promise.all([
+          getChildRows(tools.ctx, tools.account, scope, childLevel, range, refs),
+          getChildRows(tools.ctx, tools.account, scope, childLevel, previousRange, refs),
+        ]);
+        currentRows = now;
+        previousRows = then;
+      }
+
+      const previousById = new Map(previousRows.map((row) => [row.id, row.metrics]));
+      const paired: ChildPeriods[] = currentRows.map((row) => ({
+        row,
+        previous: previousById.get(row.id) ?? null,
+      }));
+
+      const days = dayCount(concrete.since, concrete.until);
+      const result = diagnose({
+        currency: tools.account.currency,
+        scope: { level: scope.level, id: input.entityId ?? null, name: scope.name },
+        current: insights.summary,
+        previous: insights.comparison.previous,
+        days,
+        childLevel,
+        children: paired,
+      });
+
+      return {
+        account: { name: sanitizeLabel(tools.account.name), currency: tools.account.currency },
+        scope: { ...result.scope, name: sanitizeLabel(result.scope.name) },
+        period: { since: concrete.since, until: concrete.until, days },
+        previousPeriod: before,
+        headline: result.headline,
+        factors: result.factors,
+        childLevel: result.childLevel,
+        // Capped like every other row-bearing result: the top movers are what
+        // the answer quotes, and the rest is context the model pays for.
+        contributions: result.contributions.slice(0, MAX_CONTRIBUTIONS).map((contribution) => ({
+          ...contribution,
+          objectName: sanitizeLabel(contribution.objectName),
+        })),
+        totalChildren: result.contributions.length,
+        signals: result.signals.map((signal) => ({
+          ...signal,
+          objectName: signal.objectName ? sanitizeLabel(signal.objectName) : null,
+        })),
+        missingMetrics: result.missingMetrics,
+        confidence: result.confidence,
+        confidenceReason: result.confidenceReason,
       };
     },
   }),

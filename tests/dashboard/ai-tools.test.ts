@@ -210,7 +210,7 @@ describe("tool definitions handed to Claude", () => {
     }
   });
 
-  it("exposes the ten read tools and the six write tools", () => {
+  it("exposes the eleven read tools and the six write tools", () => {
     const withWrites = buildToolDefinitions({ allowWrites: true }).map((tool) => tool.name);
     expect(withWrites).toEqual([
       "meta_list_ad_accounts",
@@ -220,6 +220,7 @@ describe("tool definitions handed to Claude", () => {
       "meta_get_insights",
       "meta_compare_periods",
       "meta_find_opportunities",
+      "meta_diagnose_change",
       "meta_get_campaign_detail",
       "meta_get_ad_set_detail",
       "meta_get_ad_detail",
@@ -234,7 +235,7 @@ describe("tool definitions handed to Claude", () => {
 
   it("does not even declare the write tools when writes are off", () => {
     const readOnly = buildToolDefinitions({ allowWrites: false }).map((tool) => tool.name);
-    expect(readOnly).toHaveLength(10);
+    expect(readOnly).toHaveLength(11);
     expect(readOnly.some((name) => name.includes("create") || name.includes("update"))).toBe(false);
   });
 
