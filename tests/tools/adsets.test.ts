@@ -44,6 +44,127 @@ describe("registerAdSetTools", () => {
     ]);
   });
 
+  describe("ads_get_ad_sets handler", () => {
+    const CAMPAIGN = "120252016622350439";
+    const ACCOUNT = "act_2847498105630429";
+
+    const adSet = (id: string, campaignId: string) => ({
+      id,
+      name: `Ad set ${id}`,
+      campaign_id: campaignId,
+      status: "ACTIVE",
+      effective_status: "ACTIVE",
+      optimization_goal: "OFFSITE_CONVERSIONS",
+      daily_budget: "500",
+    });
+
+    const call = (args: Record<string, unknown>) => {
+      const server = createMockMcpServer();
+      registerAdSetTools(server as never);
+      return server._registeredTools[0].handler(args) as Promise<{
+        content: Array<{ type: string; text: string }>;
+      }>;
+    };
+
+    it("scopes campaign_id through the account edge, never /{campaign_id}/adsets", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockFetchResponse({
+        data: [adSet("2001", CAMPAIGN), adSet("2002", "9999")],
+      })));
+
+      const result = await call({ account_id: ACCOUNT, limit: 25, campaign_id: CAMPAIGN });
+
+      expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+      const url = new URL(vi.mocked(fetch).mock.calls[0][0] as string);
+      expect(url.pathname).toContain(`/${ACCOUNT}/adsets`);
+      expect(url.pathname).not.toContain(CAMPAIGN);
+      expect(JSON.parse(url.searchParams.get("filtering") ?? "[]")).toEqual([
+        { field: "campaign.id", operator: "IN", value: [CAMPAIGN] },
+      ]);
+      expect(url.searchParams.get("fields")).toContain("campaign_id");
+      expect(url.searchParams.get("limit")).toBe("25");
+
+      expect(result.content[0].text).toContain("Found 1 ad set(s)");
+      expect(result.content[1].text).toContain("2001");
+      expect(result.content[1].text).not.toContain("2002");
+    });
+
+    it("keeps paging the account edge when Meta ignores the campaign filter", async () => {
+      vi.stubGlobal("fetch", vi.fn()
+        .mockResolvedValueOnce(mockFetchResponse({
+          data: [adSet("2002", "9999")],
+          paging: { cursors: { after: "CURSOR_1" }, next: "https://graph.facebook.com/next" },
+        }))
+        .mockResolvedValueOnce(mockFetchResponse({
+          data: [adSet("2001", CAMPAIGN)],
+        })));
+
+      const result = await call({ account_id: ACCOUNT, limit: 25, campaign_id: CAMPAIGN });
+
+      expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+      const second = new URL(vi.mocked(fetch).mock.calls[1][0] as string);
+      expect(second.searchParams.get("after")).toBe("CURSOR_1");
+      expect(result.content[0].text).toContain("Found 1 ad set(s)");
+      expect(result.content[1].text).toContain("2001");
+    });
+
+    it("falls back to a local-only scan when Meta rejects the campaign filter", async () => {
+      vi.stubGlobal("fetch", vi.fn()
+        .mockResolvedValueOnce(mockFetchResponse({
+          error: { message: "Invalid parameter", type: "OAuthException", code: 100 },
+        }))
+        .mockResolvedValueOnce(mockFetchResponse({
+          data: [adSet("2001", CAMPAIGN), adSet("2002", "9999")],
+        })));
+
+      const result = await call({
+        account_id: ACCOUNT,
+        limit: 25,
+        campaign_id: CAMPAIGN,
+        status_filter: ["ACTIVE"],
+      });
+
+      expect(vi.mocked(fetch)).toHaveBeenCalledTimes(2);
+      const retry = new URL(vi.mocked(fetch).mock.calls[1][0] as string);
+      expect(retry.pathname).toContain(`/${ACCOUNT}/adsets`);
+      expect(JSON.parse(retry.searchParams.get("filtering") ?? "[]")).toEqual([
+        { field: "effective_status", operator: "IN", value: ["ACTIVE"] },
+      ]);
+      expect(result.content[0].text).toContain("Found 1 ad set(s)");
+      expect(result.content[1].text).toContain("2001");
+      expect(result.content[1].text).not.toContain("2002");
+    });
+
+    it("leaves the account-only listing on a single unfiltered-by-campaign call", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockFetchResponse({
+        data: [adSet("2001", CAMPAIGN), adSet("2002", "9999")],
+        paging: { cursors: { after: "CURSOR_1" }, next: "https://graph.facebook.com/next" },
+      })));
+
+      const result = await call({ account_id: ACCOUNT, limit: 10, status_filter: ["ACTIVE", "PAUSED"] });
+
+      expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+      const url = new URL(vi.mocked(fetch).mock.calls[0][0] as string);
+      expect(url.pathname).toContain(`/${ACCOUNT}/adsets`);
+      expect(JSON.parse(url.searchParams.get("filtering") ?? "[]")).toEqual([
+        { field: "effective_status", operator: "IN", value: ["ACTIVE", "PAUSED"] },
+      ]);
+      expect(result.content[0].text).toContain("Found 2 ad set(s)");
+    });
+
+    it("stops at limit matches", async () => {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockFetchResponse({
+        data: [adSet("2001", CAMPAIGN), adSet("2002", CAMPAIGN), adSet("2003", CAMPAIGN)],
+        paging: { cursors: { after: "CURSOR_1" }, next: "https://graph.facebook.com/next" },
+      })));
+
+      const result = await call({ account_id: ACCOUNT, limit: 2, campaign_id: CAMPAIGN });
+
+      expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+      expect(result.content[0].text).toContain("Found 2 ad set(s)");
+      expect(result.content[1].text).not.toContain("2003");
+    });
+  });
+
   describe("ads_get_ad_set_details handler", () => {
     it("forces identity fields and never renders undefined with partial field requests", async () => {
       const server = createMockMcpServer();

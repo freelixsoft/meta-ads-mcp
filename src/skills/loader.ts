@@ -30,8 +30,18 @@ function skillsRoot(): string {
   return path.resolve(fileURLToPath(new URL("../../skills/", import.meta.url)));
 }
 
-/** Frontmatter is optional; only name and description are read, and only as plain scalars. */
-function parseFrontmatter(text: string): { name?: string; description?: string } {
+/**
+ * Frontmatter is optional; only name and description are read, and only as
+ * plain scalars.
+ *
+ * Line endings are normalized first. JavaScript counts CR as a line
+ * terminator, so a dot never matches it and a trailing-anchored scalar pattern
+ * fails on every CRLF line — a skill authored on Windows would silently lose
+ * its name and description and fall back to the first heading and a generic
+ * blurb.
+ */
+function parseFrontmatter(input: string): { name?: string; description?: string } {
+  const text = input.replace(/\r\n/g, "\n");
   if (!text.startsWith("---")) return {};
   const end = text.indexOf("\n---", 3);
   if (end < 0) return {};

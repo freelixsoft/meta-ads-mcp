@@ -36,7 +36,12 @@ function patternLists(): PatternList[] {
   const lists: PatternList[] = [];
   let section = "(root)";
 
-  const lines = config.split("\n");
+  // Normalized first. JavaScript counts CR as a line terminator, so a dot
+  // never matches it and every trailing-anchored pattern below fails on a CRLF
+  // checkout — which made this suite report well-formed comment lines as
+  // unparsable entries and left the secret-scanner gate permanently red on
+  // Windows, where the repository checks out with CRLF.
+  const lines = config.replace(/\r\n/g, "\n").split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
 

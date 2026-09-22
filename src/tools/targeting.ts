@@ -55,7 +55,7 @@ export function registerTargetingTools(server: McpServer): void {
           : interests
               .map(
                 (i) =>
-                  `• ${i.name} (ID: ${i.id}) — Audience: ${i.audience_size_lower_bound?.toLocaleString() ?? "?"}-${i.audience_size_upper_bound?.toLocaleString() ?? "?"}`,
+                  `• ${i.name} (ID: ${i.id}) — Audience: ${i.audience_size_lower_bound?.toLocaleString("en-US") ?? "?"}-${i.audience_size_upper_bound?.toLocaleString("en-US") ?? "?"}`,
               )
               .join("\n");
 
@@ -100,7 +100,7 @@ export function registerTargetingTools(server: McpServer): void {
           : suggestions
               .map(
                 (i) =>
-                  `• ${i.name} (ID: ${i.id}) — Audience: ${i.audience_size_lower_bound?.toLocaleString() ?? "?"}-${i.audience_size_upper_bound?.toLocaleString() ?? "?"}`,
+                  `• ${i.name} (ID: ${i.id}) — Audience: ${i.audience_size_lower_bound?.toLocaleString("en-US") ?? "?"}-${i.audience_size_upper_bound?.toLocaleString("en-US") ?? "?"}`,
               )
               .join("\n");
 
@@ -137,7 +137,7 @@ export function registerTargetingTools(server: McpServer): void {
           : behaviors
               .map(
                 (b) =>
-                  `• ${b.name} (ID: ${b.id}) — Audience: ${b.audience_size_lower_bound?.toLocaleString() ?? "?"}-${b.audience_size_upper_bound?.toLocaleString() ?? "?"}`,
+                  `• ${b.name} (ID: ${b.id}) — Audience: ${b.audience_size_lower_bound?.toLocaleString("en-US") ?? "?"}-${b.audience_size_upper_bound?.toLocaleString("en-US") ?? "?"}`,
               )
               .join("\n");
 
@@ -175,7 +175,7 @@ export function registerTargetingTools(server: McpServer): void {
           : options
               .map(
                 (d) =>
-                  `• ${d.name} (ID: ${d.id}) — Audience: ${d.audience_size_lower_bound?.toLocaleString() ?? "?"}-${d.audience_size_upper_bound?.toLocaleString() ?? "?"}`,
+                  `• ${d.name} (ID: ${d.id}) — Audience: ${d.audience_size_lower_bound?.toLocaleString("en-US") ?? "?"}-${d.audience_size_upper_bound?.toLocaleString("en-US") ?? "?"}`,
               )
               .join("\n");
 
@@ -277,7 +277,7 @@ export function registerTargetingTools(server: McpServer): void {
         content: [
           {
             type: "text",
-            text: `Estimated Audience Size: ${estimate.users_lower_bound.toLocaleString()} - ${estimate.users_upper_bound.toLocaleString()} people`,
+            text: `Estimated Audience Size: ${estimate.users_lower_bound.toLocaleString("en-US")} - ${estimate.users_upper_bound.toLocaleString("en-US")} people`,
           },
           { type: "text", text: JSON.stringify(estimate, null, 2) },
         ],

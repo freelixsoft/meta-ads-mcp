@@ -57,6 +57,21 @@ jobs:
       - name: Build
         run: npm run build
 
+      # The dashboard frontend is a separate workspace with its own lockfile.
+      # Without these steps the whole web/ tree would ship unlinted,
+      # untypechecked and unbuilt through a CI that still looks green.
+      - name: Install dashboard frontend dependencies
+        run: npm run web:install
+
+      - name: Lint dashboard frontend
+        run: npm run web:lint
+
+      - name: Typecheck dashboard frontend
+        run: npm run web:typecheck
+
+      - name: Build dashboard frontend
+        run: npm run web:build
+
       # Same shared pin as ci.yml and the local guard. Without it the action
       # supplies its own default, so this gate — the one that actually blocks
       # production — would keep drifting from the version contributors run.
@@ -192,8 +207,8 @@ jobs:
           # pinned here rather than kept as repository secrets. Neither grants
           # anything on its own: impersonating the deployer requires an OIDC
           # token this provider accepts, and the provider's attribute condition
-          # admits only freelixsoft/meta-ads-mcp. Google's own documentation
-          # puts the same two values in public workflow files for that reason.
+          # admits only byadsco/meta-ads-mcp. Google's own documentation puts
+          # the same two values in public workflow files for that reason.
           # Everything that IS a credential stays in secrets, untouched.
           workload_identity_provider: projects/639495902805/locations/global/workloadIdentityPools/github-actions/providers/github
           service_account: meta-ads-mcp-deployer@meta-ads-mcp-prod-2026.iam.gserviceaccount.com
@@ -305,6 +320,49 @@ jobs:
             fi
           fi
 
+      - name: Sync ANTHROPIC_API_KEY to Secret Manager
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GCP_RUNTIME_SERVICE_ACCOUNT: ${{ secrets.GCP_RUNTIME_SERVICE_ACCOUNT }}
+        run: |
+          set -u
+          SECRET_NAME=anthropic-api-key
+          RUNTIME_SA="${GCP_RUNTIME_SERVICE_ACCOUNT}"
+
+          # A single space, not an empty payload, when the key is not set yet:
+          # Secret Manager versions must carry bytes, and the server trims
+          # before checking, so a space reads as "not configured" — the state
+          # the dashboard already renders cleanly ("Claude AI yapılandırılmamış").
+          # This is what lets the service deploy and run before a key exists,
+          # instead of the secrets mapping below failing the whole deploy.
+          DESIRED="${ANTHROPIC_API_KEY:- }"
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "ANTHROPIC_API_KEY not set; provisioning a placeholder so the service starts with the AI panel disabled."
+          fi
+
+          ensure_iam_binding() {
+            gcloud secrets add-iam-policy-binding "$1"               --member="serviceAccount:${RUNTIME_SA}"               --role=roles/secretmanager.secretAccessor               --project="$GCP_PROJECT_ID" --condition=None --quiet >/dev/null
+          }
+
+          if ! gcloud secrets describe "$SECRET_NAME" --project="$GCP_PROJECT_ID" --quiet >/dev/null 2>&1; then
+            printf '%s' "${DESIRED}" | gcloud secrets create "$SECRET_NAME"               --data-file=- --replication-policy=automatic               --project="$GCP_PROJECT_ID" --quiet
+            ensure_iam_binding "$SECRET_NAME"
+            echo "Created Secret Manager secret $SECRET_NAME and granted ${RUNTIME_SA} access."
+          else
+            ensure_iam_binding "$SECRET_NAME"
+            # Only add a version when the value actually changed: Secret Manager
+            # bills per version, and a no-op deploy should not create one.
+            existing_hash=$(gcloud secrets versions access latest               --secret="$SECRET_NAME" --project="$GCP_PROJECT_ID" 2>/dev/null               | shasum -a 256 | cut -d' ' -f1 || true)
+            desired_hash=$(printf '%s' "${DESIRED}" | shasum -a 256 | cut -d' ' -f1)
+            if [ "${existing_hash}" != "${desired_hash}" ]; then
+              printf '%s' "${DESIRED}" | gcloud secrets versions add "$SECRET_NAME"                 --data-file=- --project="$GCP_PROJECT_ID" --quiet
+              echo "Added new version of $SECRET_NAME (value changed)."
+            else
+              echo "$SECRET_NAME is already up to date."
+            fi
+          fi
+
       - name: Configure Docker for Artifact Registry
         env:
           GCP_REGION: ${{ secrets.GCP_REGION }}
@@ -357,6 +415,12 @@ jobs:
             --min-instances=0
             --max-instances=10
             --port=3000
+          # Every line inside these block scalars is literal KEY=VALUE for the
+          # action's parser — no comments, no blank lines.
+          #
+          # The two dashboard-AI entries are optional: an empty ANTHROPIC_MODEL
+          # falls back to the pinned default, and DASHBOARD_AI_WRITES disables
+          # the assistant's write tools only when it is exactly "off".
           env_vars: |
             META_API_VERSION=v26.0
             LOG_LEVEL=info
@@ -370,6 +434,8 @@ jobs:
             AUTH_ALLOWED_DOMAINS=${{ secrets.AUTH_ALLOWED_DOMAINS }}
             AUTH_ALLOWED_FB_USER_IDS=${{ secrets.AUTH_ALLOWED_FB_USER_IDS }}
             FIRESTORE_PROJECT_ID=${{ secrets.FIRESTORE_PROJECT_ID }}
+            ANTHROPIC_MODEL=${{ secrets.ANTHROPIC_MODEL }}
+            DASHBOARD_AI_WRITES=${{ secrets.DASHBOARD_AI_WRITES }}
           secrets: |
             META_TOKENS=meta-tokens-prod:latest
             OAUTH_SECRET=oauth-secret:latest
@@ -377,6 +443,7 @@ jobs:
             SESSION_COOKIE_SECRET=session-cookie-secret:latest
             META_APP_SECRET=meta-app-secret:latest
             MCP_API_KEY=mcp-api-key:latest
+            ANTHROPIC_API_KEY=anthropic-api-key:latest
 
       - name: Mask service URL in logs
         env:
@@ -409,6 +476,27 @@ jobs:
             echo "OAuth metadata check passed (HTTP ${OAUTH_STATUS})"
           else
             echo "OAuth metadata check FAILED (HTTP ${OAUTH_STATUS})"
+            exit 1
+          fi
+
+          # The dashboard shell must bounce a signed-out visitor to Meta login.
+          # A 404 here means the SPA bundle did not make it into the image.
+          DASH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${SERVICE_URL}/dashboard" --max-time 10)
+          if [ "${DASH_STATUS}" = "302" ]; then
+            echo "Dashboard shell check passed (HTTP ${DASH_STATUS})"
+          else
+            echo "Dashboard shell check FAILED (HTTP ${DASH_STATUS}; expected 302 to Meta login)"
+            exit 1
+          fi
+
+          # 401 (not 404) proves the AI routes are mounted: the session gate
+          # runs before routing, so anything under /api/dashboard answers 401
+          # without a cookie, and a 404 would mean the router is missing.
+          AI_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${SERVICE_URL}/api/dashboard/ai/status" --max-time 10)
+          if [ "${AI_STATUS}" = "401" ]; then
+            echo "Dashboard API check passed (HTTP ${AI_STATUS}, session gate active)"
+          else
+            echo "Dashboard API check FAILED (HTTP ${AI_STATUS}; expected 401)"
             exit 1
           fi
 

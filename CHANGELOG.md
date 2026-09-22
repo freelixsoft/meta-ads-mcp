@@ -7,7 +7,71 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- **A Claude assistant in the dashboard.** `/dashboard` gains a Turkish
+  conversational panel that answers questions about an ad account from real
+  Meta data — "hangi reklam para kaybettiriyor?", "son 7 günde ne değişti?",
+  "bütçeyi hangi reklam setlerine artırayım?" — and lists the reads it used
+  underneath each answer, with row counts and the resolved date range, so an
+  answer can be checked against the tables.
+
+  It runs on the Anthropic Messages API (`@anthropic-ai/sdk`, model pinned to
+  `claude-opus-5` and overridable with `ANTHROPIC_MODEL`). The key is a
+  server-side setting: it is read only in `src/claude/client.ts`, is never sent
+  to the browser, logged, or placed in a tool result. Without it the panel
+  reports itself unconfigured and no request is made — nothing else changes.
+
+  Claude reaches Meta only through fifteen high-level tools whose arguments are
+  Zod schemas, and those tools call the *existing* dashboard services, so there
+  is still one Meta client, one cache, one guardrail path and one authorization
+  model. Every id is re-authorized against the session's own account list and,
+  below the account, against Meta's own answer.
+
+  **Changes require approval.** A write tool does not write: it validates,
+  authorizes and stages a plan server-side, and the browser receives only a
+  description and an opaque id. The change reaches Meta after the user approves
+  it, once, within ten minutes, from the session and account that staged it —
+  then the object is re-read and what Meta actually stored is reported. The
+  operator can disable writes entirely with `DASHBOARD_AI_WRITES=off`.
+
+  Bounded on five axes so one question cannot run away: six model round-trips,
+  twelve tool calls, 12 KB per tool result and 60 KB per turn, 120 s of wall
+  clock, and one proposed change. A repeat of a read already served in the same
+  turn is refused without spending a call. The system prompt and tool schemas
+  are cached across turns.
+
+  New endpoints, all behind the existing session cookie and same-origin check:
+  `GET /api/dashboard/ai/status`, `POST /api/dashboard/accounts/:id/ai/chat`
+  and `POST /api/dashboard/accounts/:id/ai/confirm`, alongside the one-shot
+  `/ai/ask` and `/ai/summary`. See [docs/dashboard.md](docs/dashboard.md).
+
+- **`npm run claude:verify`.** The only thing in the repository that makes a
+  live Anthropic call, and only when a human runs it. With no key it exits
+  before building a request. It checks that the key is accepted, that the real
+  system prompt and tool schemas are accepted by the API, that the model reaches
+  for a tool, that a tool result produces a Turkish answer, and that prompt
+  caching is working. It never touches Meta.
+
 ### Fixed
+
+- **Skill frontmatter was silently dropped on CRLF files.** JavaScript counts
+  CR as a line terminator, so `.` never matches it and the `(.*)$` scalar
+  pattern in `parseFrontmatter` failed on every line of a file authored on
+  Windows. The skill then fell back to its first heading and a generic
+  description. Line endings are normalized before parsing.
+
+- **MCP tool output no longer changes shape with the server's locale.** Fifteen
+  `toLocaleString()` calls in `insights-helpers`, `macros` and `targeting` had
+  no locale pinned, so an audience size or an impression count rendered as
+  `50,000` or `50.000` depending on where the container ran. All now pin
+  `en-US`, matching `ad-dossier`.
+
+- **`/health` is exempt from the production https redirect.** Container health
+  probes reach the port directly, with no proxy and therefore no
+  `x-forwarded-proto`, so the redirect made a healthy instance look dead — the
+  Dockerfile's own HEALTHCHECK hits it over plain HTTP. The exemption is an
+  exact path match; the dashboard, the OAuth surface and `/mcp` still redirect.
 
 - **ffmpeg's encoders are limited to one thread.** The wrapper passed
   `-threads 1` before `-i`, which bounds decoding, and `-filter_threads 1`,

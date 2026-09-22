@@ -1,6 +1,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { metaApiClient } from "../meta/client.js";
+import { getAfterCursor, hasNextPage } from "../meta/paginator.js";
 import { normalizeAccountId, validateMetaId } from "../utils/format.js";
 import { buildFieldsParam } from "../utils/validation.js";
 import { ADSET_DEFAULT_FIELDS } from "../meta/types/adset.js";
@@ -317,12 +319,84 @@ function findCreativeOverride(
   );
 }
 
+interface MetaFilterEntry {
+  field: string;
+  operator: string;
+  value: unknown;
+}
+
+type AdSetQueryParams = Record<string, string | number | boolean>;
+
+// Meta refuses /{campaign_id}/adsets for tokens that read the very same ad sets
+// fine through /act_<id>/adsets, so campaign scoping never walks the campaign
+// edge. Ask Meta to narrow with campaign.id, then verify campaign_id on every
+// returned ad set and keep paging until `limit` matches are in hand, so the
+// result stays correct even if Meta ignores the filter.
+const CAMPAIGN_SCAN_MAX_PAGES = 10;
+
+async function scanAccountAdSets(
+  path: string,
+  params: AdSetQueryParams,
+  campaignId: string,
+  limit: number,
+): Promise<AdSet[]> {
+  const matches: AdSet[] = [];
+  let after: string | undefined;
+
+  for (let page = 0; page < CAMPAIGN_SCAN_MAX_PAGES; page++) {
+    const response = await metaApiClient.get<MetaApiResponse<AdSet>>(
+      path,
+      after ? { ...params, after } : params,
+    );
+    const batch = response.data ?? [];
+
+    for (const adSet of batch) {
+      if (adSet.campaign_id === campaignId) matches.push(adSet);
+      if (matches.length >= limit) return matches;
+    }
+
+    if (batch.length === 0 || !hasNextPage(response.paging)) break;
+    after = getAfterCursor(response.paging);
+    if (!after) break;
+  }
+
+  return matches;
+}
+
+async function fetchAdSetsForCampaign(
+  path: string,
+  params: AdSetQueryParams,
+  filters: MetaFilterEntry[],
+  campaignId: string,
+  limit: number,
+): Promise<AdSet[]> {
+  const filtered: AdSetQueryParams = {
+    ...params,
+    filtering: JSON.stringify([
+      ...filters,
+      { field: "campaign.id", operator: "IN", value: [campaignId] },
+    ]),
+  };
+
+  try {
+    return await scanAccountAdSets(path, filtered, campaignId, limit);
+  } catch (error) {
+    if (!(error instanceof McpError) || error.code !== ErrorCode.InvalidParams) throw error;
+
+    // Meta rejected the filter clause itself — rescan the account edge without
+    // it and narrow to the campaign locally.
+    const unfiltered: AdSetQueryParams = { ...params };
+    if (filters.length > 0) unfiltered.filtering = JSON.stringify(filters);
+    return scanAccountAdSets(path, unfiltered, campaignId, limit);
+  }
+}
+
 export function registerAdSetTools(server: McpServer): void {
   // ─── Get Ad Sets ─────────────────────────────────────────────
   server.registerTool(
     "ads_get_ad_sets",
     {
-      description: "Get ad sets for an ad account. Optionally filter by campaign or status.",
+      description: "Get ad sets for an ad account. Optionally filter by campaign or status. Campaign filtering reads the account's /adsets edge (never /{campaign_id}/adsets, which Meta refuses for tokens that can read the same ad sets through the account) and verifies campaign_id on every ad set it returns.",
       inputSchema: {
         account_id: z.string().describe("Ad account ID"),
         limit: z.number().min(1).max(100).default(25),
@@ -332,24 +406,28 @@ export function registerAdSetTools(server: McpServer): void {
       annotations: { ...READ },
     },
     async ({ account_id, limit, campaign_id, status_filter }) => {
-      const path = campaign_id
-        ? `/${validateMetaId(campaign_id, "campaign")}/adsets`
-        : `/${normalizeAccountId(account_id)}/adsets`;
+      const path = `/${normalizeAccountId(account_id)}/adsets`;
+      const campaignId = campaign_id ? validateMetaId(campaign_id, "campaign") : undefined;
 
       const fieldsParam = buildFieldsParam(undefined, [...ADSET_DEFAULT_FIELDS]);
-      const params: Record<string, string | number | boolean> = {
+      const params: AdSetQueryParams = {
         fields: fieldsParam,
         limit,
       };
 
-      if (status_filter && status_filter.length > 0) {
-        params.filtering = JSON.stringify([
-          { field: "effective_status", operator: "IN", value: status_filter },
-        ]);
-      }
+      const filters: MetaFilterEntry[] =
+        status_filter && status_filter.length > 0
+          ? [{ field: "effective_status", operator: "IN", value: status_filter }]
+          : [];
 
-      const response = await metaApiClient.get<MetaApiResponse<AdSet>>(path, params);
-      const adSets = response.data ?? [];
+      let adSets: AdSet[];
+      if (campaignId) {
+        adSets = await fetchAdSetsForCampaign(path, params, filters, campaignId, limit);
+      } else {
+        if (filters.length > 0) params.filtering = JSON.stringify(filters);
+        const response = await metaApiClient.get<MetaApiResponse<AdSet>>(path, params);
+        adSets = response.data ?? [];
+      }
 
       const text =
         adSets.length === 0

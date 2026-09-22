@@ -28,6 +28,9 @@ import type { GeminiKeyStatus } from "../store/gemini-key-repo.js";
 import type { ApifyTokenStatus } from "../store/apify-token-repo.js";
 
 import { validateAuthorizeQuery } from "./authorize-validation.js";
+import { createDashboardApiRouter } from "../dashboard/router.js";
+import { mountDashboardStatic } from "../dashboard/static.js";
+import { DASHBOARD_API_PATH } from "../dashboard/paths.js";
 import {
   FirestoreClientsStore,
   InMemoryClientsStore,
@@ -77,6 +80,25 @@ function normalizeHostname(hostname: string): string {
   return hostname.startsWith("[") && hostname.endsWith("]")
     ? hostname.slice(1, -1)
     : hostname;
+}
+
+/**
+ * Whether a production request should be bounced to https.
+ *
+ * Everything is redirected except `/health`. Container health probes reach the
+ * port directly, with no proxy in front and therefore no `x-forwarded-proto`,
+ * so redirecting them makes a healthy instance look dead — the Dockerfile's own
+ * HEALTHCHECK hits it over plain HTTP, and an HTTP startup probe on Cloud Run
+ * would do the same. `/health` carries no cookie, no credential and no user
+ * data, so the exemption costs nothing; the dashboard, the OAuth surface and
+ * /mcp all still redirect.
+ */
+export function shouldRedirectToHttps(request: {
+  path: string;
+  forwardedProto?: string;
+}): boolean {
+  if (request.path === "/health") return false;
+  return request.forwardedProto !== "https";
 }
 
 export function getServerUrl(): URL {
@@ -326,7 +348,13 @@ function createCombinedAuthMiddleware(
   };
 }
 
-function buildMetaTokenMiddleware(
+/**
+ * Exported for the tenant-isolation tests: this is the seam where a request
+ * acquires the Meta token it will spend, and the rule it enforces — one
+ * caller, one identity, never a shared fallback — is worth pinning directly
+ * rather than through the whole HTTP stack.
+ */
+export function buildMetaTokenMiddleware(
   serverUrl: URL,
   multiTenantEnabled: boolean,
 ): express.RequestHandler {
@@ -358,7 +386,9 @@ function buildMetaTokenMiddleware(
       } catch (err) {
         logger.warn(
           {
-            fbUserId,
+            // Hashed like every other identity in the logs (CODE-B5): a raw
+            // Facebook user id in log retention is PII we have no reason to keep.
+            fbUserId: hashPii(fbUserId),
             error: err instanceof Error ? err.message : String(err),
           },
           "Failed to resolve user Meta token",
@@ -374,6 +404,34 @@ function buildMetaTokenMiddleware(
         });
         return;
       }
+    }
+
+    // Fail closed rather than fall back to a server-wide credential.
+    //
+    // Everything below this line is a token that belongs to the *server*, not
+    // to a caller: the token-manager registry and META_ACCESS_TOKEN. In
+    // single-tenant mode that is exactly right — there is one operator and one
+    // account. In multi-tenant mode it is not: a request that got this far has
+    // no OAuth identity (API-key auth carries none) and no X-Meta-Token of its
+    // own, so serving it a server-wide token would let an unidentified caller
+    // act on whichever advertiser that token belongs to. This is the same rule
+    // `resolveTenantId` already applies to the Apify and Gemini credentials;
+    // the Meta token is the one that was still falling through.
+    if (multiTenantEnabled) {
+      logger.warn(
+        { event: "meta_token_no_tenant" },
+        "Refusing a multi-tenant request with no OAuth identity and no X-Meta-Token",
+      );
+      res.status(401).json({
+        jsonrpc: "2.0",
+        error: {
+          code: -32001,
+          message:
+            "This server is in multi-tenant mode, so a request must carry its own identity. Authenticate through the Meta OAuth flow (/authorize), or send the caller's own token in X-Meta-Token. A server-wide token is never used to answer for an unidentified caller.",
+        },
+        id: null,
+      });
+      return;
     }
 
     const managerToken = tokenManager.getActiveToken();
@@ -451,7 +509,7 @@ export async function startHttpTransport(
 
   if (isProduction) {
     app.use((req, res, next) => {
-      if (req.header("x-forwarded-proto") !== "https") {
+      if (shouldRedirectToHttps({ path: req.path, forwardedProto: req.header("x-forwarded-proto") })) {
         res.redirect(301, `https://${req.header("host")}${req.originalUrl}`);
         return;
       }
@@ -699,6 +757,14 @@ export async function startHttpTransport(
         pendingAuthStorage.run({ fbUserId: session.fbUserId }, () => next());
       },
     );
+
+    // Additive: the dashboard is a separate namespace that shares the
+    // session cookie and the Meta token resolution with everything above
+    // it, and touches neither /mcp nor the OAuth endpoints. Mounted inside
+    // the multi-tenant branch on purpose — without Meta OAuth there is no
+    // browser session to authenticate it with.
+    app.use(DASHBOARD_API_PATH, createDashboardApiRouter(serverUrl));
+    mountDashboardStatic(app);
   }
 
   app.use("/register", createRateLimiter(20, 15 * 60 * 1000));

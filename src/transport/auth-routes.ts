@@ -34,8 +34,16 @@ import { createGeminiClient, validateGeminiKeyInput } from "../gemini/client.js"
 import { ApifyApiClient } from "../apify/client.js";
 import type { ApifyEnvelope, ApifyUser } from "../apify/types.js";
 import { CONNECTIONS_PATH, renderConnectionsPage } from "./html-pages.js";
+import { DASHBOARD_PATH } from "../dashboard/paths.js";
 
-const STANDALONE_RETURN_PATHS = new Set<string>([CONNECTIONS_PATH]);
+/**
+ * Destinations login may return to that are not an OAuth /authorize request.
+ * Matched as exact strings, before any URL parsing, so no normalization quirk
+ * can turn a hostile input into one of them. The dashboard is here because it
+ * is a first-party page a signed-out user lands on directly; adding it does
+ * not widen validation for any other path.
+ */
+const STANDALONE_RETURN_PATHS = new Set<string>([CONNECTIONS_PATH, DASHBOARD_PATH]);
 
 /**
  * Short timeout and no retries, unlike the shared `apifyApiClient` singleton
@@ -129,7 +137,10 @@ const OAUTH_STATE_TTL_MS = 10 * 60 * 1000;
  * On any failure, fall back to "/authorize" — the landing page handles
  * unauthenticated users.
  */
-export type SafeReturnFallback = "/authorize" | typeof CONNECTIONS_PATH;
+export type SafeReturnFallback =
+  | "/authorize"
+  | typeof CONNECTIONS_PATH
+  | typeof DASHBOARD_PATH;
 
 /**
  * `fallback` is a literal union on purpose: a caller can never route a user to

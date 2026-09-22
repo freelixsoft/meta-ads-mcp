@@ -1,3 +1,12 @@
+FROM node:22-alpine3.24 AS web-builder
+WORKDIR /app/web
+
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --ignore-scripts
+
+COPY web/ ./
+RUN npm run build
+
 FROM node:22-alpine3.24 AS builder
 WORKDIR /app
 
@@ -17,6 +26,8 @@ ENV NODE_ENV=production
 RUN apk add --no-cache ffmpeg
 
 COPY --from=builder /app/dist/ dist/
+# The dashboard SPA is served by the same Express process under /dashboard.
+COPY --from=web-builder /app/web/dist/ dist/public/
 COPY --from=builder /app/node_modules/ node_modules/
 COPY package.json ./
 # The skills ship with the server: they are published as MCP resources at runtime.

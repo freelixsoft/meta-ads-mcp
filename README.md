@@ -18,6 +18,7 @@
 - [Aligned with Meta's official MCP](#aligned-with-metas-official-mcp)
 - [Features](#features)
 - [Tools (142 total)](#tools-142-total)
+- [Dashboard and Claude assistant](#dashboard-and-claude-assistant)
 - [Quick start](#quick-start)
 - [Authentication — three modes](#authentication--three-modes)
 - [Setting up Sign in with Meta](#setting-up-sign-in-with-meta)
@@ -257,6 +258,29 @@ runner, byte caps and time budget as the rest of the video pipeline. Everything
 the model writes is delimited as untrusted content and flattened to single
 lines, so an analysis cannot forge the structure around it.
 
+## Dashboard and Claude assistant
+
+The same Express process also serves a browser dashboard at `/dashboard`, in
+Turkish, behind the same Meta login as the consent page. It reads the account
+through the same service layer the MCP tools use — one Meta client, one cache,
+one authorization model — and adds no login of its own.
+
+- **Overview, campaigns, ad sets, ads.** Spend, impressions, reach, clicks,
+  CTR, CPC, CPM, add-to-cart, purchases, purchase value, cost per purchase and
+  ROAS, with a previous-period comparison and drill-down.
+- **A Claude assistant.** Ask "hangi reklam para kaybettiriyor?" and it reads
+  what it needs through a bounded tool surface, answers in Turkish, and lists
+  the Meta data it used underneath the answer.
+- **Changes need approval.** The assistant can *propose* a campaign, ad set or
+  ad change; it cannot make one. A proposal is staged server-side and reaches
+  Meta only after the user approves it in a confirmation dialog, after which the
+  object is read back and the stored result reported.
+
+The assistant needs `ANTHROPIC_API_KEY` on the server. Without it everything
+else still works and the panel shows a "not configured" state rather than
+failing. Full architecture, tool list, bounds and deployment environment:
+**[docs/dashboard.md](docs/dashboard.md)**.
+
 ## Skills and MCP protocol surface
 
 An agent connecting to this server does not have to work out which of 142 tools
@@ -361,6 +385,15 @@ For local development with `stdio` (no OAuth, no Firestore needed):
 
 ```bash
 META_ACCESS_TOKEN=EAA...           # the only required value in stdio mode
+```
+
+For the dashboard's Claude assistant (optional — the rest of the server runs
+without it):
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-...       # server-side only, never sent to the browser
+ANTHROPIC_MODEL=                   # optional, defaults to claude-opus-5
+DASHBOARD_AI_WRITES=               # set to "off" to run the assistant read-only
 ```
 
 ## Authentication — three modes

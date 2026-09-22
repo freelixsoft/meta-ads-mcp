@@ -51,6 +51,21 @@ jobs:
       - name: Build
         run: npm run build
 
+      # The dashboard frontend is a separate workspace with its own lockfile.
+      # Without these steps the whole web/ tree would ship unlinted,
+      # untypechecked and unbuilt through a CI that still looks green.
+      - name: Install dashboard frontend dependencies
+        run: npm run web:install
+
+      - name: Lint dashboard frontend
+        run: npm run web:lint
+
+      - name: Typecheck dashboard frontend
+        run: npm run web:typecheck
+
+      - name: Build dashboard frontend
+        run: npm run web:build
+
   secret-scan:
     name: gitleaks (secret scan)
     # Required check: the job must always run so it can report a
