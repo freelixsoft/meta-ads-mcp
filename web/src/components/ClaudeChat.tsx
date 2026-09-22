@@ -349,6 +349,7 @@ export function ClaudeChat({
                   key={message.id}
                   confirmation={message.suggestion.confirmation}
                   status={message.suggestion.status}
+                  writesEnabled={status.data.writesEnabled}
                   busy={busy}
                   onApprove={() => decide(message.id, "approve")}
                   onReject={() => decide(message.id, "cancel")}
@@ -599,12 +600,15 @@ const CONFIDENCE_LABEL: Record<"low" | "medium" | "high", string> = {
 function SuggestionCard({
   confirmation,
   status,
+  writesEnabled,
   busy,
   onApprove,
   onReject,
 }: {
   confirmation: AiConfirmation;
   status: SuggestionStatus;
+  /** False when the operator switched writes off for this deployment. */
+  writesEnabled: boolean;
   busy: boolean;
   onApprove: () => void;
   onReject: () => void;
@@ -667,10 +671,15 @@ function SuggestionCard({
 
         {decided ? (
           <p className="text-xs text-ink-400">{decided.note}</p>
-        ) : (
+        ) : writesEnabled ? (
           <p className="text-xs text-ink-500">
             Onaylayana kadar Meta'ya hiçbir istek gönderilmedi. Bu onay{" "}
             {formatExpiry(confirmation.expiresAt)} geçerli.
+          </p>
+        ) : (
+          <p className="rounded-lg border border-warn-400/30 bg-warn-400/10 px-3 py-2 text-xs text-warn-400">
+            Reklam değiştirme yetkisi bu sunucuda kapalı. Öneri incelenebilir, ancak onaylansa da
+            Meta'ya gönderilmez.
           </p>
         )}
       </div>

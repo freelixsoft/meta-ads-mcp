@@ -535,6 +535,100 @@ describe("an ad has no budget at any time", () => {
   });
 });
 
+/**
+ * The four requests a user actually makes about this chain, and what each one
+ * is allowed to produce. Together they say the same thing four ways: the
+ * object the user named is the object the system acts on, and when that object
+ * has nothing to change the answer is a sentence, not a different object.
+ */
+describe("A–D: what each request produces", () => {
+  const CBO_CAMPAIGN = { ...CAMPAIGN, daily_budget: "150000" };
+  const CBO_SET2 = { ...SET2, daily_budget: undefined as unknown as string };
+
+  it("A) ad set budget under CBO → no write plan", async () => {
+    ENTITIES["500"] = CBO_CAMPAIGN;
+    ENTITIES["600"] = CBO_SET2;
+    try {
+      await expect(
+        plan("meta_update_ad_set", { adSetId: "600", becauseOfAdId: "700", dailyBudget: 2000 }),
+      ).rejects.toBeInstanceOf(DashboardError);
+      expect(metaPostFormMock).not.toHaveBeenCalled();
+    } finally {
+      ENTITIES["500"] = CAMPAIGN;
+      ENTITIES["600"] = SET2;
+    }
+  });
+
+  it("B) the same request must not become a campaign change", async () => {
+    ENTITIES["500"] = CBO_CAMPAIGN;
+    ENTITIES["600"] = CBO_SET2;
+    try {
+      const refusal = await plan("meta_update_ad_set", {
+        adSetId: "600",
+        dailyBudget: 2000,
+      }).catch((caught: unknown) => caught as InstanceType<typeof DashboardError>);
+      expect(refusal.message).toMatch(/do not propose a campaign budget change/i);
+
+      // The move the refusal forbids, attempted anyway.
+      await expect(
+        plan("meta_update_campaign", { campaignId: "500", dailyBudget: 2000 }),
+      ).rejects.toBeInstanceOf(DashboardError);
+      expect(metaPostFormMock).not.toHaveBeenCalled();
+    } finally {
+      ENTITIES["500"] = CAMPAIGN;
+      ENTITIES["600"] = SET2;
+    }
+  });
+
+  it("C) campaign budget asked for by name → a campaign-level plan", async () => {
+    const result = await plan("meta_update_campaign", {
+      campaignId: "500",
+      dailyBudget: 2000,
+      campaignBudgetRequestedByUser: true,
+    });
+
+    // The card the user should see.
+    const labelled = Object.fromEntries(result.fields.map((field) => [field.label, field.value]));
+    expect(labelled["Kampanya"]).toBe("SATIŞLAR REKLAMI");
+    expect(labelled["Yeni günlük bütçe"]).toContain("2.000,00 TRY");
+
+    // The object written, and the snapshot the stale check will compare.
+    expect(result.path).toBe("/500");
+    expect(result.verify).toMatchObject({ level: "campaign", id: "500" });
+    expect(result.body).toEqual({ daily_budget: "200000" });
+    // Planning is not writing, whatever the kill switch says.
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+
+  it("C) shows the previous budget so the card reads X → Y", async () => {
+    const withBudget = { ...CAMPAIGN, daily_budget: "150000" };
+    ENTITIES["500"] = withBudget;
+    try {
+      const result = await plan("meta_update_campaign", {
+        campaignId: "500",
+        dailyBudget: 2000,
+        campaignBudgetRequestedByUser: true,
+      });
+      const labelled = Object.fromEntries(result.fields.map((f) => [f.label, f.value]));
+      expect(labelled["Yeni günlük bütçe"]).toContain("önce 1.500,00 TRY");
+      expect(result.expected).toEqual({ daily_budget: 1500 });
+    } finally {
+      ENTITIES["500"] = CAMPAIGN;
+    }
+  });
+
+  it("D) an ad budget → explained, and no silent move to another level", async () => {
+    const error = await plan("meta_update_ad", { adId: "700", dailyBudget: 2000 }).catch(
+      (caught: unknown) => caught as InstanceType<typeof DashboardError>,
+    );
+
+    expect(error.message).toMatch(/an ad\s+has no budget at all/i);
+    expect(error.message).toContain("SET2");
+    expect(error.message).toMatch(/Do NOT switch to the ad set or the campaign on your own/i);
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("a read that Meta refuses", () => {
   it("surfaces the real reason instead of hiding it", async () => {
     // The production failure verbatim: Meta's application request limit.

@@ -295,7 +295,22 @@ export async function runDashboardChat(
 
   await assertAvailable();
 
-  const allowWrites = writesEnabled() && input.allowWrites !== false;
+  /**
+   * Whether the write tools are declared to the model at all.
+   *
+   * Deliberately NOT gated on DASHBOARD_AI_WRITES. Planning a change writes
+   * nothing: a write tool authorizes the target, builds the form body and
+   * stages it server-side, and the only code that reaches Meta with a POST is
+   * `applyDashboardConfirmation`, which refuses outright while the switch is
+   * off. Gating the declaration as well meant the assistant answered a plain
+   * request — "change this campaign's budget" — with "I have no write tool",
+   * which is true and useless: the operator wanted proposals reviewable, not
+   * invisible.
+   *
+   * So the switch now means what it says: no change reaches Meta. Proposals
+   * are still produced, still shown, and still refused on approval.
+   */
+  const allowWrites = input.allowWrites !== false;
 
   let result;
   try {

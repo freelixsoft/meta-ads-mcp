@@ -488,7 +488,7 @@ describe("the confirmation round trip", () => {
     expect(metaPostFormMock).not.toHaveBeenCalled();
   });
 
-  it("does not stage a change at all when writes are switched off", async () => {
+  it("still proposes a change when writes are switched off, and refuses it on approval", async () => {
     process.env.DASHBOARD_AI_WRITES = "off";
     configureClaudeClientForTests(
       scriptedClient([
@@ -502,8 +502,24 @@ describe("the confirmation round trip", () => {
     });
     const body = (await response.json()) as Record<string, unknown>;
 
-    expect(body.confirmation).toBeNull();
-    expect(pendingWriteCount()).toBe(0);
+    // Inverted deliberately. The switch used to hide the write tools from the
+    // model, so a plain "change this budget" came back as "I have no write
+    // tool" — true, and useless to an operator who wanted proposals reviewable
+    // rather than invisible. Planning writes nothing; the switch guards the
+    // only code that reaches Meta, which is the approval.
+    expect(body.confirmation).not.toBeNull();
+    expect(pendingWriteCount()).toBe(1);
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+
+    const confirmationId = (body.confirmation as { id: string }).id;
+    const approval = await post("/api/dashboard/accounts/act_111/ai/confirm", {
+      body: { confirmationId, decision: "approve" },
+    });
+
+    expect(approval.status).toBe(403);
+    await expect(approval.json()).resolves.toMatchObject({
+      error: { code: "ai_writes_disabled" },
+    });
     expect(metaPostFormMock).not.toHaveBeenCalled();
   });
 });
