@@ -9,6 +9,7 @@ import { sanitizeLabel, sanitizeLine } from "../dashboard/ai/sanitize.js";
 import { listAccessibleAccounts } from "../dashboard/services/accounts.js";
 import { getCampaignsWithMetrics } from "../dashboard/services/campaigns.js";
 import { METRIC_KEYS } from "../dashboard/services/comparison.js";
+import { filterEntityRows } from "../dashboard/services/entity-filters.js";
 import {
   authorizeAd,
   authorizeAdSet,
@@ -70,6 +71,24 @@ const limitField = z
 
 const INSIGHT_LEVELS = ["account", "campaign", "adset", "ad"] as const;
 
+/**
+ * Find rows by name, using the same matcher the drill-down table uses.
+ *
+ * Substring, accent- and case-folded, and deliberately NOT "best match": a
+ * search for "J3" returns J3 and JJ3 both, because picking one of them here
+ * would be the tool guessing which ad the user meant. Every match is returned
+ * so the answer can ask.
+ */
+const nameQueryField = z
+  .string()
+  .trim()
+  .min(1)
+  .max(200)
+  .optional()
+  .describe(
+    "Filter by name (substring, case-insensitive). Use it to find a named object instead of paging the whole account. Every match is returned — 'J3' also matches 'JJ3', so say which one you mean rather than assuming.",
+  );
+
 // ─── Bounded result mappers ──────────────────────────────────────
 
 /**
@@ -82,9 +101,13 @@ function toRowResult(row: EntityRowDto): Record<string, unknown> {
     id: row.id,
     name: sanitizeLabel(row.name),
     status: sanitizeLabel(row.effectiveStatus ?? row.status) || "UNKNOWN",
-    // Parent names travel with the row: in an account-wide list, "which
-    // campaign is this ad set in" is not obvious from context.
+    // The parent CHAIN travels with the row — ids as well as names. Without
+    // the ids the model can see that an ad lives in "SET2" and still have no
+    // way to address SET2, which is exactly how a budget request aimed at an
+    // ad set ends up pointed at an ad that has no budget.
+    campaignId: row.campaignId,
     campaignName: row.campaignName ? sanitizeLabel(row.campaignName) : null,
+    adSetId: row.adSetId,
     adSetName: row.adSetName ? sanitizeLabel(row.adSetName) : null,
     dailyBudget: row.dailyBudget,
     lifetimeBudget: row.lifetimeBudget,
@@ -157,7 +180,9 @@ function entitySummary(entity: EntityRef): Record<string, unknown> {
     status: entity.status ? sanitizeLabel(entity.status) : null,
     effectiveStatus: entity.effectiveStatus ? sanitizeLabel(entity.effectiveStatus) : null,
     objective: entity.objective ? sanitizeLabel(entity.objective) : null,
+    campaignId: entity.campaignId,
     campaignName: entity.campaignName ? sanitizeLabel(entity.campaignName) : null,
+    adSetId: entity.adSetId,
     adSetName: entity.adSetName ? sanitizeLabel(entity.adSetName) : null,
     dailyBudget: entity.dailyBudget,
     lifetimeBudget: entity.lifetimeBudget,
@@ -244,6 +269,7 @@ export const READ_TOOLS: ReadTool[] = [
           .enum(["ALL", "ACTIVE", "PAUSED", "ARCHIVED", "DELETED"])
           .optional()
           .describe("Filter by configured status. Default ALL."),
+        q: nameQueryField,
         limit: limitField,
       })
       .superRefine(checkRange),
@@ -272,7 +298,9 @@ export const READ_TOOLS: ReadTool[] = [
       return {
         account: { name: sanitizeLabel(tools.account.name), currency: tools.account.currency },
         period: { preset: range.label, since: range.since, until: range.until },
-        ...sortAndCap(rows, input.limit),
+        // Filtered before the cap, or a named object outside the top rows by
+        // spend would be invisible to a search that should have found it.
+        ...sortAndCap(filterEntityRows(rows, { q: input.q }), input.limit),
       };
     },
   }),
@@ -282,7 +310,7 @@ export const READ_TOOLS: ReadTool[] = [
     description:
       "Ad sets with their metrics for a period, highest spend first. Omit campaignId to get every ad set in the account in one call — that is how you find the worst ad set without walking the tree. Pass campaignId only when the question is about one campaign.",
     schema: z
-      .object({ ...rangeFields, campaignId: entityIdSchema.optional(), limit: limitField })
+      .object({ ...rangeFields, campaignId: entityIdSchema.optional(), q: nameQueryField, limit: limitField })
       .superRefine(checkRange),
     label: (input) =>
       input.campaignId
@@ -301,7 +329,7 @@ export const READ_TOOLS: ReadTool[] = [
         parent: { level: parent.level, id: input.campaignId ?? null, name: sanitizeLabel(parent.name) },
         currency: tools.account.currency,
         period: { preset: range.label, since: range.since, until: range.until },
-        ...sortAndCap(rows, input.limit),
+        ...sortAndCap(filterEntityRows(rows, { q: input.q }), input.limit),
       };
     },
   }),
@@ -311,7 +339,7 @@ export const READ_TOOLS: ReadTool[] = [
     description:
       "Ads with their metrics for a period, highest spend first. Omit adSetId to get every ad in the account in one call — that is how you answer 'which ad is losing money' or 'which ad should I turn off'. Pass adSetId only when the question is about one ad set.",
     schema: z
-      .object({ ...rangeFields, adSetId: entityIdSchema.optional(), limit: limitField })
+      .object({ ...rangeFields, adSetId: entityIdSchema.optional(), q: nameQueryField, limit: limitField })
       .superRefine(checkRange),
     label: (input) =>
       input.adSetId
@@ -330,7 +358,7 @@ export const READ_TOOLS: ReadTool[] = [
         parent: { level: parent.level, id: input.adSetId ?? null, name: sanitizeLabel(parent.name) },
         currency: tools.account.currency,
         period: { preset: range.label, since: range.since, until: range.until },
-        ...sortAndCap(rows, input.limit),
+        ...sortAndCap(filterEntityRows(rows, { q: input.q }), input.limit),
       };
     },
   }),
@@ -968,6 +996,11 @@ export const WRITE_TOOLS: WriteTool[] = [
       risk: riskField,
       confidence: confidenceField,
       adSetId: entityIdSchema,
+      becauseOfAdId: entityIdSchema
+        .optional()
+        .describe(
+          "The ad whose performance prompted this, when the request started from one. An ad has no budget of its own, so a budget change asked for 'this ad' belongs on its ad set — pass the ad here and the confirmation names the whole chain (ad, ad set, campaign) instead of only the object being written.",
+        ),
       name: nameField.optional(),
       status: z.enum(STATUS_VALUES).optional(),
       dailyBudget: budgetField,
@@ -987,8 +1020,29 @@ export const WRITE_TOOLS: WriteTool[] = [
         if (campaignHoldsTheBudget(parent)) refuseAdSetBudgetUnderCbo(parent, tools.account.currency);
       }
 
+      // The chain, top to bottom, so the card shows what is being changed AND
+      // what prompted it. An ad named here is re-authorized and checked to
+      // actually sit in this ad set: a card that claims a relationship Meta
+      // does not report would be worse than one that omits it.
+      const fields: ConfirmationField[] = [];
+      if (input.becauseOfAdId) {
+        const ad = await authorizeAd(tools.ctx, tools.account, input.becauseOfAdId);
+        if (ad.adSetId !== adSet.id) {
+          throw new DashboardError(
+            "invalid_request",
+            400,
+            `Ad ${ad.id} does not belong to ad set ${adSet.id}. Read the ad first and use the adSetId it reports.`,
+          );
+        }
+        fields.push({ label: "Reklam", value: sanitizeLabel(ad.name) });
+      }
       const body: Record<string, string> = {};
-      const fields: ConfirmationField[] = [{ label: "Reklam seti", value: sanitizeLabel(adSet.name) }];
+      fields.push({ label: "Reklam seti", value: sanitizeLabel(adSet.name) });
+      if (adSet.campaignName) {
+        fields.push({ label: "Kampanya", value: sanitizeLabel(adSet.campaignName) });
+      }
+      /** Rows added above describe the object; only what follows is a change. */
+      const contextRows = fields.length;
       if (input.name !== undefined) {
         body.name = input.name;
         fields.push({ label: "Yeni ad", value: input.name });
@@ -1008,7 +1062,7 @@ export const WRITE_TOOLS: WriteTool[] = [
         body.lifetime_budget = toMinorUnits(input.lifetimeBudget);
         fields.push({ label: "Yeni toplam bütçe", value: money(input.lifetimeBudget, tools.account.currency) });
       }
-      requireSomething(fields.slice(1), "ad set");
+      requireSomething(fields.slice(contextRows), "ad set");
 
       return {
         tool: "meta_update_ad_set",
