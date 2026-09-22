@@ -462,7 +462,7 @@ describe("write tools — planning never writes", () => {
   });
 
   it("authorizes the target of an update and shows the previous budget", async () => {
-    const result = await plan("meta_update_campaign", { campaignId: "100", dailyBudget: 2000 });
+    const result = await plan("meta_update_campaign", { campaignId: "100", dailyBudget: 2000, campaignBudgetRequestedByUser: true });
     expect(metaPostFormMock).not.toHaveBeenCalled();
     expect(result.path).toBe("/100");
     expect(result.body).toEqual({ daily_budget: "200000" });

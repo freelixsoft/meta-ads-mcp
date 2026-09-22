@@ -303,7 +303,22 @@ async function executeToolUse(
       },
       "Claude tool execution failed",
     );
-    return resultBlock(use.id, { error: mapped.code, message: mapped.message }, true);
+    return resultBlock(
+      use.id,
+      {
+        error: mapped.code,
+        message: mapped.message,
+        // Without this a failed read reads as an invitation to find another
+        // way to be helpful, and the model retargets: it could not read the ad
+        // set, so it proposed a campaign budget instead. A read that failed is
+        // missing information, not permission to change the question.
+        guidance:
+          "This read failed, so you do not have the value you asked for. Tell the user which read " +
+          "failed and why, and stop. Do NOT propose a change to a different object, do not fall " +
+          "back to a parent, and do not state or estimate a number this call did not return.",
+      },
+      true,
+    );
   }
 }
 

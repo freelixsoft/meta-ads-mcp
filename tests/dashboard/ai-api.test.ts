@@ -376,7 +376,7 @@ describe("the confirmation round trip", () => {
   async function proposeChange(): Promise<{ id: string; body: Record<string, unknown> }> {
     configureClaudeClientForTests(
       scriptedClient([
-        toolUse("meta_update_campaign", { reason: "Test gerekçesi.", campaignId: "100", dailyBudget: 2000 }),
+        toolUse("meta_update_campaign", { reason: "Test gerekçesi.", campaignId: "100", dailyBudget: 2000, campaignBudgetRequestedByUser: true }),
         text("Onaylarsanız günlük bütçeyi 2.000 TRY yapacağım."),
       ]),
     );
@@ -492,7 +492,7 @@ describe("the confirmation round trip", () => {
     process.env.DASHBOARD_AI_WRITES = "off";
     configureClaudeClientForTests(
       scriptedClient([
-        toolUse("meta_update_campaign", { reason: "Test gerekçesi.", campaignId: "100", dailyBudget: 2000 }),
+        toolUse("meta_update_campaign", { reason: "Test gerekçesi.", campaignId: "100", dailyBudget: 2000, campaignBudgetRequestedByUser: true }),
         text("Değişiklik yapamıyorum."),
       ]),
     );

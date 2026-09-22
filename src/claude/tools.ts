@@ -841,6 +841,12 @@ export const WRITE_TOOLS: WriteTool[] = [
       risk: riskField,
       confidence: confidenceField,
       campaignId: entityIdSchema,
+      campaignBudgetRequestedByUser: z
+        .boolean()
+        .optional()
+        .describe(
+          "Set true ONLY when the user asked for the CAMPAIGN budget in those terms. Required for any budget change here. A campaign budget is shared by every ad set under it, so a request about one ad set is never a request about the campaign — if you could not read the ad set, say so and stop; do not retarget.",
+        ),
       name: nameField.optional(),
       status: z.enum(STATUS_VALUES).optional(),
       dailyBudget: budgetField,
@@ -848,6 +854,27 @@ export const WRITE_TOOLS: WriteTool[] = [
     }),
     async plan(input, tools) {
       assertSingleBudget(input.dailyBudget, input.lifetimeBudget);
+
+      // The failure this closes was observed in production: a read of the ad
+      // set timed out on Meta's insights quota, and rather than reporting that,
+      // the model moved the budget request up to the campaign — an object the
+      // user had not mentioned, shared by every ad set under it. A budget here
+      // now requires the model to state that the user asked for the campaign,
+      // so retargeting takes a deliberate false claim rather than a slip.
+      const touchesBudget = input.dailyBudget !== undefined || input.lifetimeBudget !== undefined;
+      if (touchesBudget && input.campaignBudgetRequestedByUser !== true) {
+        throw new DashboardError(
+          "invalid_request",
+          400,
+          "A campaign budget change requires campaignBudgetRequestedByUser: true, and that flag is " +
+            "only honest when the user asked for the CAMPAIGN budget in those terms. A campaign " +
+            "budget is shared by every ad set under it, so a request about one ad set is not a " +
+            "request about the campaign. If you could not read the ad set — a failed read, a rate " +
+            "limit, a missing budget under CBO — tell the user exactly that and stop. Do not " +
+            "substitute a different object.",
+        );
+      }
+
       const campaign = await authorizeCampaign(tools.ctx, tools.account, input.campaignId);
 
       const body: Record<string, string> = {};

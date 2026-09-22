@@ -59,9 +59,27 @@ const META_AUTH_MESSAGE_PREFIXES = [
   "Authentication required",
 ] as const;
 
+/**
+ * Phrases that mean "Meta is throttling", in Meta's own words as well as ours.
+ *
+ * Getting this list wrong is not a cosmetic miss. Anything not matched here
+ * falls through to `account_forbidden` — "this ad set is not accessible with
+ * the connected Meta user" — which reads as a permanent verdict about the
+ * object rather than a transient limit on the caller. That was observed in
+ * production: a throttled read of an ad set was reported as inaccessible, and
+ * the assistant, told the object was out of reach, proposed a change to its
+ * parent campaign instead of reporting a failed read.
+ *
+ * The first two are how this codebase phrases it; the rest are Meta's, taken
+ * from the errors the Marketing API actually returns (codes 4, 17, 32, 80004).
+ */
 const META_THROTTLE_MARKERS = [
   "rate limit",
   "temporarily blocked",
+  "request limit reached",
+  "too many calls",
+  "reduce the amount of data",
+  "please retry your request later",
 ] as const;
 
 function messageOf(error: unknown): string {

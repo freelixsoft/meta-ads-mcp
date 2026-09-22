@@ -343,6 +343,137 @@ describe("a budget change asked for an ad lands on its ad set", () => {
   });
 });
 
+/**
+ * The live regression.
+ *
+ * "J3 reklamının bulunduğu reklam setinin günlük bütçesini 2.000 TL yapmayı
+ * öner." J3 and SET2 resolved correctly, then meta_get_ad_set_detail hit
+ * Meta's insights rate limit. Unable to read SET2, the model proposed a
+ * campaign budget change instead — 1.500 → 2.000 on SATIŞLAR REKLAMI, an
+ * object the user had not mentioned and one whose budget every ad set under it
+ * shares. Nothing in the code stopped it, because up to that point nothing had
+ * gone wrong: the ids were right and the write tool was a real tool.
+ */
+describe("regression: a failed ad set read must not become a campaign budget change", () => {
+  it("reads SET2's budget from the list, which costs no insights call", async () => {
+    const result = (await read("meta_get_ad_sets", { preset: "last_30d", q: "SET2" })) as {
+      rows: Array<Row & { dailyBudget: number | null }>;
+    };
+
+    const set2 = result.rows.find((row) => row.name === "SET2");
+    expect(set2?.id).toBe("600");
+    expect(set2?.dailyBudget).toBe(1200);
+    expect(set2?.campaignId).toBe("500");
+    // The budget is on the row. Reaching for the detail tool to see it is what
+    // spent the insights quota in production.
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+
+  it("refuses a campaign budget change that the user did not ask for", async () => {
+    // Exactly the call the model made after the failed read: the campaign id,
+    // a budget, and no claim that the user asked about the campaign.
+    await expect(
+      plan("meta_update_campaign", { campaignId: "500", dailyBudget: 2000 }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+
+  it("says why, so the model is told to report the failed read instead", async () => {
+    const error = await plan("meta_update_campaign", {
+      campaignId: "500",
+      dailyBudget: 2000,
+    }).catch((caught: unknown) => caught as InstanceType<typeof DashboardError>);
+
+    expect(error.message).toContain("campaignBudgetRequestedByUser");
+    expect(error.message).toMatch(/shared by every ad set/i);
+    expect(error.message).toMatch(/Do not\s+substitute a different object/i);
+  });
+
+  it("allows a campaign budget when the user really did ask for it", async () => {
+    const result = await plan("meta_update_campaign", {
+      campaignId: "500",
+      dailyBudget: 2000,
+      campaignBudgetRequestedByUser: true,
+    });
+
+    expect(result.path).toBe("/500");
+    expect(result.body).toEqual({ daily_budget: "200000" });
+    expect(result.verify).toMatchObject({ level: "campaign", id: "500" });
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves campaign status and rename changes alone", async () => {
+    // The flag guards budgets, not the tool: pausing a campaign never needed it.
+    const result = await plan("meta_update_campaign", { campaignId: "500", status: "PAUSED" });
+    expect(result.body).toEqual({ status: "PAUSED" });
+  });
+
+  it("keeps the ad set as the target when the ad set is what was asked about", async () => {
+    const result = await plan("meta_update_ad_set", {
+      adSetId: "600",
+      becauseOfAdId: "700",
+      dailyBudget: 2000,
+    });
+
+    // The whole point of the regression: the object written is SET2, and the
+    // card names the chain that led to it.
+    expect(result.path).toBe("/600");
+    expect(result.verify).toMatchObject({ level: "adset", id: "600" });
+    const labelled = Object.fromEntries(result.fields.map((field) => [field.label, field.value]));
+    expect(labelled["Reklam"]).toBe("J3");
+    expect(labelled["Reklam seti"]).toBe("SET2");
+    expect(labelled["Kampanya"]).toBe("SATIŞLAR REKLAMI");
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("a read that Meta refuses", () => {
+  it("surfaces the real reason instead of hiding it", async () => {
+    // The production failure verbatim: Meta's application request limit.
+    metaGetMock.mockRejectedValue(
+      Object.assign(new Error("Application request limit reached"), { code: 17 }),
+    );
+
+    const failure = await read("meta_get_ad_set_detail", {
+      preset: "last_30d",
+      adSetId: "600",
+    }).catch((caught: unknown) => caught);
+
+    expect(failure).toBeInstanceOf(DashboardError);
+    // A throttle must keep its own classification. Collapsed into
+    // account_forbidden it reads as a permanent verdict about the object —
+    // which is what told the model SET2 was out of reach and sent it looking
+    // for something else to change.
+    expect((failure as InstanceType<typeof DashboardError>).code).toBe("meta_rate_limited");
+    expect((failure as Error).message).not.toMatch(/not accessible/i);
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+
+  it("classifies Meta's other throttle phrasings the same way", async () => {
+    for (const phrase of [
+      "(#4) Application request limit reached",
+      "(#17) User request limit reached",
+      "(#80004) There have been too many calls to this ad-account",
+      "Please reduce the amount of data you're asking for, then retry your request",
+    ]) {
+      metaGetMock.mockRejectedValue(new Error(phrase));
+      const failure = await read("meta_get_ad_set_detail", {
+        preset: "last_30d",
+        adSetId: "600",
+      }).catch((caught: unknown) => caught as InstanceType<typeof DashboardError>);
+
+      expect(failure.code, phrase).toBe("meta_rate_limited");
+    }
+  });
+
+  it("does not let the ad set list fabricate a budget when Meta is unreachable", async () => {
+    metaGetPaginatedMock.mockRejectedValue(new Error("Application request limit reached"));
+
+    await expect(read("meta_get_ad_sets", { preset: "last_30d", q: "SET2" })).rejects.toThrow();
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("the ad write tool has no budget to offer", () => {
   it("rejects a budget on meta_update_ad at the schema", () => {
     const tool = WRITE_TOOLS_BY_NAME.get("meta_update_ad");
