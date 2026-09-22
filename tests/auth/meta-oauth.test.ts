@@ -47,6 +47,64 @@ describe("Meta OAuth Graph API version", () => {
   });
 });
 
+describe("the authorize URL sent to Meta", () => {
+  const serverUrl = new URL("https://mcp.example.com");
+
+  beforeEach(() => {
+    vi.stubEnv("META_APP_ID", "1234567890");
+    vi.stubEnv("META_APP_SECRET", "dummy-secret");
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("asks for the two ads scopes and nothing else", () => {
+    const config = loadMetaOAuthConfig(serverUrl);
+    const url = new URL(buildAuthorizeUrl(config as NonNullable<typeof config>, "state123"));
+    const scopes = (url.searchParams.get("scope") ?? "").split(",");
+
+    expect(scopes).toContain("ads_management");
+    expect(scopes).toContain("ads_read");
+    expect(scopes).toHaveLength(2);
+  });
+
+  it("never asks for email, which this Meta app rejects as an invalid scope", () => {
+    const config = loadMetaOAuthConfig(serverUrl);
+    const url = buildAuthorizeUrl(config as NonNullable<typeof config>, "state123");
+
+    // Checked against the whole URL, not just the parsed list: a scope smuggled
+    // in by any other route would break the login dialog the same way.
+    expect(url).not.toContain("email");
+    expect(new URL(url).searchParams.get("scope")).toBe("ads_management,ads_read");
+  });
+
+  it("does not name public_profile, which Facebook Login grants implicitly", () => {
+    const config = loadMetaOAuthConfig(serverUrl);
+    const url = buildAuthorizeUrl(config as NonNullable<typeof config>, "state123");
+    expect(url).not.toContain("public_profile");
+  });
+
+  it("builds the callback from SERVER_URL and never from a localhost default", () => {
+    const config = loadMetaOAuthConfig(serverUrl);
+    expect(config?.redirectUri).toBe("https://mcp.example.com/auth/meta/callback");
+
+    const url = new URL(buildAuthorizeUrl(config as NonNullable<typeof config>, "state123"));
+    expect(url.searchParams.get("redirect_uri")).toBe("https://mcp.example.com/auth/meta/callback");
+    expect(url.searchParams.get("state")).toBe("state123");
+    // The app secret has no business in a URL the browser is redirected to.
+    expect(url.search).not.toContain("dummy-secret");
+    expect(url.searchParams.get("client_secret")).toBeNull();
+  });
+
+  it("lets META_OAUTH_REDIRECT_URI override the derived callback", () => {
+    vi.stubEnv("META_OAUTH_REDIRECT_URI", "https://ads.example.com/auth/meta/callback");
+    expect(loadMetaOAuthConfig(serverUrl)?.redirectUri).toBe(
+      "https://ads.example.com/auth/meta/callback",
+    );
+  });
+});
+
 describe("fetchPrimaryBusiness", () => {
   beforeEach(() => {
     vi.spyOn(globalThis, "fetch");

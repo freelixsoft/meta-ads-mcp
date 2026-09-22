@@ -4,16 +4,45 @@ import { resolveMetaApiVersion } from "../meta/api-version.js";
 const META_GRAPH = "https://graph.facebook.com";
 const META_OAUTH_DIALOG = "https://www.facebook.com";
 
-const DEFAULT_SCOPES = [
-  "ads_management",
-  "ads_read",
-  "pages_show_list",
-  "pages_read_engagement",
-  "business_management",
-  "whatsapp_business_management",
-  "email",
-  "public_profile",
-];
+/**
+ * The permissions requested at the login dialog.
+ *
+ * Meta rejects the whole dialog with "Invalid Scopes" if it is handed a
+ * permission the app is not configured for — the user does not get a partial
+ * consent screen, they get an error page and no login at all. So this list is
+ * the set the Ads surface genuinely needs, and nothing that merely might be
+ * useful one day:
+ *
+ *  - `ads_read`       — /me/adaccounts, and every campaign / ad set / ad /
+ *                       insights read the dashboard and the MCP tools perform.
+ *  - `ads_management` — creating and updating campaigns, ad sets and ads.
+ *
+ * `public_profile` is not listed because Facebook Login grants it implicitly;
+ * it is what makes `/me?fields=id,name,picture` work. Naming it adds risk and
+ * buys nothing.
+ *
+ * Four permissions were deliberately dropped from this list, each with a cost
+ * worth knowing before anyone adds one back:
+ *
+ *  - `email` — tried, and this app is rejected for it. `fetchProfile` still
+ *    asks for the field, but Meta only fills it in when the permission was
+ *    granted, so `profile.email` is always null. AUTH_ALLOWED_EMAILS and
+ *    AUTH_ALLOWED_DOMAINS therefore match nobody; AUTH_ALLOWED_FB_USER_IDS is
+ *    the only allowlist that can admit a user.
+ *  - `business_management` — `fetchPrimaryBusiness` (/me/businesses) now fails
+ *    and returns null, which it already handles: the token is stored with
+ *    businessId and businessName null. Nothing else depends on it.
+ *  - `pages_show_list` — the page tools in src/tools/accounts.ts (/me/accounts,
+ *    /{id}/promote_pages) will fail for a user who calls them.
+ *  - `whatsapp_business_management` — the WhatsApp tools in src/tools/whatsapp*
+ *    will fail for a user who calls them.
+ *
+ * The last three need App Review before they can be requested at all, so
+ * listing them without it broke login for everyone, including the Ads users
+ * who never touch those tools. Re-add one only after the app actually holds
+ * the permission.
+ */
+const DEFAULT_SCOPES = ["ads_management", "ads_read"];
 
 export interface MetaOAuthConfig {
   appId: string;
