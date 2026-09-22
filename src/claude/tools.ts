@@ -738,14 +738,17 @@ function refuseAdSetBudgetUnderCbo(campaign: EntityRef, currency: string): never
       `level — Campaign Budget Optimization / Advantage campaign budget — currently ${current}.`,
       "Its ad sets therefore have no budget of their own, which is why an ad set's daily budget reads",
       "as null. That null is not a missing value to fill in.",
-      "Do NOT retry this as an ad set budget, and do NOT quietly change the campaign budget instead:",
-      "a campaign budget is shared by every ad set under that campaign, so changing it affects all of",
-      "them and is not what was asked for.",
-      "Instead, tell the user in Turkish that this campaign's budget is set at campaign level, say what",
-      "it is now, and ask whether they want the CAMPAIGN budget changed to the figure they named.",
-      `Only after they say yes, in a later turn, call meta_update_campaign with campaignId ${campaign.id}.`,
-      "If what they actually wanted was to turn an ad set on or off, call meta_update_ad_set again with",
-      "only `status` and no budget field — that is allowed under CBO and is a separate request.",
+      "STOP HERE. Do not retry this as an ad set budget, do not propose a campaign budget change, and",
+      "do not ask the user whether they would like the campaign budget changed instead. The user asked",
+      "about this ad set. A campaign budget is a different object shared by every ad set under the",
+      "campaign, and offering it as an alternative is how a request about one ad set turns into a",
+      "change to all of them.",
+      "Answer in Turkish with the fact and nothing more: this ad set has no budget of its own because",
+      "the campaign uses CBO, so its budget cannot be changed separately. Do not name a figure to",
+      "change the campaign to, and do not end with a question inviting one.",
+      "If the user later asks for the CAMPAIGN budget in those words, that is a new request and",
+      "meta_update_campaign handles it then.",
+      "Turning this ad set on or off is unaffected: call meta_update_ad_set again with only `status`.",
     ].join(" "),
   );
 }
@@ -1173,7 +1176,23 @@ export const WRITE_TOOLS: WriteTool[] = [
         body.status = input.status;
         fields.push({ label: "Yeni durum", value: STATUS_LABEL[input.status] ?? input.status });
       }
-      requireSomething(fields.slice(1), "ad");
+      // Zod strips a budget aimed at an ad before it reaches here, so "nothing
+      // to change" is the shape a budget attempt arrives in. Saying only "no
+      // change was requested" would leave the model to guess why, and the
+      // guess it made in production was to move the request to another object.
+      if (fields.length === 1) {
+        throw new DashboardError(
+          "invalid_request",
+          400,
+          `No change was requested for ad "${sanitizeLabel(ad.name)}" (id ${ad.id}). Note that an ad ` +
+            "has no budget at all — only a name and a status — so a budget cannot be set on one. " +
+            "Budgets live on the ad set, or on the campaign when it uses CBO. If the user asked for " +
+            "this ad's budget, say that an ad has no budget of its own and that the ad set " +
+            `(${ad.adSetName ? `"${sanitizeLabel(ad.adSetName)}", ` : ""}id ${ad.adSetId ?? "unknown"}) ` +
+            "is the level where one exists. Do NOT switch to the ad set or the campaign on your own " +
+            "— tell them and let them say which object they mean.",
+        );
+      }
 
       return {
         tool: "meta_update_ad",

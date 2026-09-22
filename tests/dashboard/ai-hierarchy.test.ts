@@ -427,6 +427,114 @@ describe("regression: a failed ad set read must not become a campaign budget cha
   });
 });
 
+/**
+ * Object levels, and the rule that the assistant never picks a different one.
+ *
+ * Under CBO an ad set has no budget and an ad never has one. Both are dead
+ * ends, and a dead end is a complete answer: "this object has no budget of its
+ * own" is the truth the user asked for. What the assistant must not do is
+ * treat the dead end as a prompt to find something it CAN change — the
+ * campaign — because that is a different object, shared by every ad set under
+ * it, and the user did not ask about it.
+ */
+describe("a CBO ad set is a dead end, not a detour to the campaign", () => {
+  /** SET2, but under a campaign that holds the budget itself. */
+  const CBO_CAMPAIGN = { ...CAMPAIGN, daily_budget: "150000" };
+  const CBO_SET2 = { ...SET2, daily_budget: undefined as unknown as string };
+
+  beforeEach(() => {
+    ENTITIES["500"] = CBO_CAMPAIGN;
+    ENTITIES["600"] = CBO_SET2;
+  });
+
+  afterEach(() => {
+    ENTITIES["500"] = CAMPAIGN;
+    ENTITIES["600"] = SET2;
+  });
+
+  it("refuses an ad set budget and produces no write plan", async () => {
+    await expect(
+      plan("meta_update_ad_set", { adSetId: "600", becauseOfAdId: "700", dailyBudget: 2000 }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+
+  it("states the fact without offering the campaign budget as an alternative", async () => {
+    const error = await plan("meta_update_ad_set", {
+      adSetId: "600",
+      dailyBudget: 2000,
+    }).catch((caught: unknown) => caught as InstanceType<typeof DashboardError>);
+
+    // The fact the user is owed.
+    expect(error.message).toMatch(/Campaign Budget Optimization|CBO/);
+    expect(error.message).toMatch(/no budget of their own/i);
+
+    // And the three things it must NOT do. These assertions exist because the
+    // previous wording did all three: it told the model to ask whether the
+    // user wanted the campaign budget changed "to the figure they named".
+    expect(error.message).toMatch(/do not propose a campaign budget change/i);
+    expect(error.message).toMatch(/do not ask the user whether/i);
+    expect(error.message).not.toMatch(/ask whether they want the CAMPAIGN budget changed/i);
+    expect(error.message).toMatch(/STOP HERE/);
+  });
+
+  it("still allows pausing the ad set, which CBO does not affect", async () => {
+    const result = await plan("meta_update_ad_set", { adSetId: "600", status: "PAUSED" });
+    expect(result.body).toEqual({ status: "PAUSED" });
+    expect(result.path).toBe("/600");
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+
+  it("does not let the refusal become a campaign budget change", async () => {
+    // The move the model must not make next: same figure, parent object, no
+    // claim that the user asked for the campaign.
+    await expect(
+      plan("meta_update_campaign", { campaignId: "500", dailyBudget: 2000 }),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+
+  it("targets the campaign only when the user asked for the campaign budget", async () => {
+    const result = await plan("meta_update_campaign", {
+      campaignId: "500",
+      dailyBudget: 2000,
+      campaignBudgetRequestedByUser: true,
+    });
+
+    expect(result.path).toBe("/500");
+    expect(result.verify).toMatchObject({ level: "campaign", id: "500" });
+    expect(result.body).toEqual({ daily_budget: "200000" });
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("an ad has no budget at any time", () => {
+  it("refuses a budget aimed at J3 and explains the level", async () => {
+    // zod strips the budget, so the plan sees an ad with nothing to change —
+    // which is exactly the shape a budget attempt arrives in.
+    const error = await plan("meta_update_ad", {
+      adId: "700",
+      dailyBudget: 2000,
+    }).catch((caught: unknown) => caught as InstanceType<typeof DashboardError>);
+
+    expect(error).toBeInstanceOf(DashboardError);
+    expect(error.message).toMatch(/an ad\s+has no budget at all/i);
+    expect(error.message).toContain("J3");
+    // It names the ad set as the level where a budget exists…
+    expect(error.message).toContain("SET2");
+    expect(error.message).toContain("600");
+    // …and forbids moving there on its own.
+    expect(error.message).toMatch(/Do NOT switch to the ad set or the campaign on your own/i);
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+
+  it("still plans a status change on the ad", async () => {
+    const result = await plan("meta_update_ad", { adId: "700", status: "PAUSED" });
+    expect(result.body).toEqual({ status: "PAUSED" });
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+});
+
 describe("a read that Meta refuses", () => {
   it("surfaces the real reason instead of hiding it", async () => {
     // The production failure verbatim: Meta's application request limit.

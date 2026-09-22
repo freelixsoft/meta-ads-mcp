@@ -547,7 +547,7 @@ describe("write tools — planning never writes", () => {
     expect(metaPostFormMock).not.toHaveBeenCalled();
   });
 
-  it("tells the model the budget is at campaign level and to ask before moving it", async () => {
+  it("states the CBO fact and offers nothing in its place", async () => {
     const error = await plan("meta_update_ad_set", { adSetId: "202", dailyBudget: 500 }).catch(
       (caught: unknown) => caught as InstanceType<typeof DashboardError>,
     );
@@ -556,11 +556,18 @@ describe("write tools — planning never writes", () => {
     expect(error.message).toContain("kızın diğer videoları");
     expect(error.message).toContain("102");
     expect(error.message).toContain("500,00 TRY");
-    // And forbids both wrong turns: retrying at ad set level, or silently
-    // redirecting the write to the shared campaign budget.
-    expect(error.message).toMatch(/do NOT retry this as an ad set budget/i);
-    expect(error.message).toMatch(/do NOT quietly change the campaign budget/i);
-    expect(error.message).toMatch(/ask whether they want the CAMPAIGN budget changed/i);
+    // Retrying at ad set level is still forbidden.
+    expect(error.message).toMatch(/Do not retry this as an ad set budget/i);
+
+    // This assertion used to require the opposite. The wording told the model
+    // to ask whether the user wanted the CAMPAIGN budget changed "to the
+    // figure they named", and in practice that is an offer: a request about
+    // one ad set came back as a proposal to move a budget shared by all of
+    // them. A dead end is a complete answer; it is not a prompt to find
+    // something else to change.
+    expect(error.message).toMatch(/do not propose a campaign budget change/i);
+    expect(error.message).toMatch(/do not ask the user whether/i);
+    expect(error.message).not.toMatch(/ask whether they want the CAMPAIGN budget changed/i);
   });
 
   it("still lets a CBO ad set be activated, because status is a separate request", async () => {
