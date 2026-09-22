@@ -558,6 +558,10 @@ export interface WritePlan {
   title: string;
   description: string;
   fields: ConfirmationField[];
+  /** What could go wrong, in the model’s words. Optional: not every proposal has one. */
+  risk: string | null;
+  /** How well the data supports acting, when the proposal came from a finding. */
+  confidence: "low" | "medium" | "high" | null;
   /**
    * Why the model is proposing this, in its own words and already sanitized.
    * Shown in the confirmation dialog: a user approving a budget change needs
@@ -616,6 +620,23 @@ const MAX_REASON_CHARS = 300;
  * with no argument behind it. Model-authored free text, so it is sanitized on
  * the way into the plan rather than on the way out to the browser.
  */
+const riskField = z
+  .string()
+  .trim()
+  .min(1)
+  .max(MAX_REASON_CHARS)
+  .optional()
+  .describe(
+    "One short Turkish sentence naming what could go wrong if this is applied. Copy the finding’s risk when the proposal came from meta_find_opportunities.",
+  );
+
+const confidenceField = z
+  .enum(["low", "medium", "high"])
+  .optional()
+  .describe(
+    "How well the data supports acting. Copy the finding’s confidence when the proposal came from meta_find_opportunities; omit it otherwise rather than guessing.",
+  );
+
 const reasonField = z
   .string()
   .trim()
@@ -735,6 +756,8 @@ export const WRITE_TOOLS: WriteTool[] = [
       "Propose creating a campaign in the selected ad account. Nothing is sent to Meta until the user approves the confirmation this produces. Campaigns are created paused unless the user explicitly asks for active.",
     schema: z.object({
       reason: reasonField,
+      risk: riskField,
+      confidence: confidenceField,
       name: nameField.describe("Campaign name as the user wants it."),
       objective: z.enum(OBJECTIVES),
       status: z.enum(STATUS_VALUES).optional(),
@@ -770,6 +793,8 @@ export const WRITE_TOOLS: WriteTool[] = [
         title: "Meta'da yeni kampanya oluşturulacak",
         description: "Onaylarsanız bu kampanya Meta hesabınızda oluşturulur.",
         reason: sanitizeLine(input.reason, MAX_REASON_CHARS),
+        risk: input.risk ? sanitizeLine(input.risk, MAX_REASON_CHARS) : null,
+        confidence: input.confidence ?? null,
         fields,
         path: `/${tools.account.id}/campaigns`,
         body,
@@ -785,6 +810,8 @@ export const WRITE_TOOLS: WriteTool[] = [
       "Propose changing an existing campaign: rename it, pause or activate it, or change its budget. Status changes and budget changes both go through this tool — there is no separate status tool. Nothing is sent to Meta until the user approves.",
     schema: z.object({
       reason: reasonField,
+      risk: riskField,
+      confidence: confidenceField,
       campaignId: entityIdSchema,
       name: nameField.optional(),
       status: z.enum(STATUS_VALUES).optional(),
@@ -823,6 +850,8 @@ export const WRITE_TOOLS: WriteTool[] = [
         title: "Kampanya güncellenecek",
         description: "Onaylarsanız bu değişiklik Meta'ya gönderilir.",
         reason: sanitizeLine(input.reason, MAX_REASON_CHARS),
+        risk: input.risk ? sanitizeLine(input.risk, MAX_REASON_CHARS) : null,
+        confidence: input.confidence ?? null,
         fields,
         path: `/${campaign.id}`,
         body,
@@ -838,6 +867,8 @@ export const WRITE_TOOLS: WriteTool[] = [
       "Propose creating an ad set inside a campaign. Targeting is limited to countries, age range and gender — anything more detailed has to be done in Ads Manager. Nothing is sent to Meta until the user approves.",
     schema: z.object({
       reason: reasonField,
+      risk: riskField,
+      confidence: confidenceField,
       campaignId: entityIdSchema,
       name: nameField,
       status: z.enum(STATUS_VALUES).optional(),
@@ -917,6 +948,8 @@ export const WRITE_TOOLS: WriteTool[] = [
         title: "Meta'da yeni reklam seti oluşturulacak",
         description: "Onaylarsanız bu reklam seti kampanyanın altında oluşturulur.",
         reason: sanitizeLine(input.reason, MAX_REASON_CHARS),
+        risk: input.risk ? sanitizeLine(input.risk, MAX_REASON_CHARS) : null,
+        confidence: input.confidence ?? null,
         fields,
         path: `/${tools.account.id}/adsets`,
         body,
@@ -932,6 +965,8 @@ export const WRITE_TOOLS: WriteTool[] = [
       "Propose changing an existing ad set: rename it, pause or activate it, or change its budget. Nothing is sent to Meta until the user approves.",
     schema: z.object({
       reason: reasonField,
+      risk: riskField,
+      confidence: confidenceField,
       adSetId: entityIdSchema,
       name: nameField.optional(),
       status: z.enum(STATUS_VALUES).optional(),
@@ -980,6 +1015,8 @@ export const WRITE_TOOLS: WriteTool[] = [
         title: "Reklam seti güncellenecek",
         description: "Onaylarsanız bu değişiklik Meta'ya gönderilir.",
         reason: sanitizeLine(input.reason, MAX_REASON_CHARS),
+        risk: input.risk ? sanitizeLine(input.risk, MAX_REASON_CHARS) : null,
+        confidence: input.confidence ?? null,
         fields,
         path: `/${adSet.id}`,
         body,
@@ -995,6 +1032,8 @@ export const WRITE_TOOLS: WriteTool[] = [
       "Propose creating an ad inside an ad set from an existing creative. The creative must already exist in the account — this tool does not upload media. Nothing is sent to Meta until the user approves.",
     schema: z.object({
       reason: reasonField,
+      risk: riskField,
+      confidence: confidenceField,
       adSetId: entityIdSchema,
       name: nameField,
       creativeId: entityIdSchema.describe("Id of a creative that already exists in this ad account."),
@@ -1008,6 +1047,8 @@ export const WRITE_TOOLS: WriteTool[] = [
         title: "Meta'da yeni reklam oluşturulacak",
         description: "Onaylarsanız bu reklam, seçili reklam setinin altında oluşturulur.",
         reason: sanitizeLine(input.reason, MAX_REASON_CHARS),
+        risk: input.risk ? sanitizeLine(input.risk, MAX_REASON_CHARS) : null,
+        confidence: input.confidence ?? null,
         fields: [
           { label: "Reklam adı", value: input.name },
           { label: "Reklam seti", value: sanitizeLabel(adSet.name) },
@@ -1033,6 +1074,8 @@ export const WRITE_TOOLS: WriteTool[] = [
       "Propose changing an existing ad: rename it, or pause or activate it. Nothing is sent to Meta until the user approves.",
     schema: z.object({
       reason: reasonField,
+      risk: riskField,
+      confidence: confidenceField,
       adId: entityIdSchema,
       name: nameField.optional(),
       status: z.enum(STATUS_VALUES).optional(),
@@ -1056,6 +1099,8 @@ export const WRITE_TOOLS: WriteTool[] = [
         title: "Reklam güncellenecek",
         description: "Onaylarsanız bu değişiklik Meta'ya gönderilir.",
         reason: sanitizeLine(input.reason, MAX_REASON_CHARS),
+        risk: input.risk ? sanitizeLine(input.risk, MAX_REASON_CHARS) : null,
+        confidence: input.confidence ?? null,
         fields,
         path: `/${ad.id}`,
         body,

@@ -74,6 +74,10 @@ export interface PendingConfirmation {
   description: string;
   /** The model's argument for the change, shown next to the Onayla button. */
   reason: string;
+  /** What could go wrong, when the model supplied one. */
+  risk: string | null;
+  /** How well the data supports acting, when the proposal came from a finding. */
+  confidence: "low" | "medium" | "high" | null;
   fields: ConfirmationField[];
   accountName: string;
   expiresAt: number;

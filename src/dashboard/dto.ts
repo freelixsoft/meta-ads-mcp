@@ -231,6 +231,8 @@ export interface AiConfirmationDto {
   description: string;
   /** Why the assistant is proposing the change. */
   reason: string;
+  risk: string | null;
+  confidence: "low" | "medium" | "high" | null;
   fields: Array<{ label: string; value: string }>;
   accountName: string;
   expiresAt: number;

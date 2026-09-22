@@ -21,7 +21,27 @@ interface ChatMessage {
   stopReason?: AiChatResponse["stopReason"];
   /** The question that produced this bubble, so it can be asked again. */
   retryOf?: string;
+  /**
+   * A proposed change, rendered as a card in the stream rather than a modal.
+   *
+   * It lives in the transcript because that is where the reasoning that
+   * produced it lives: scrolling back should show what was proposed, what the
+   * user decided and why, not an empty gap where a dialog used to be. The
+   * status is what makes a second approval impossible — the buttons exist only
+   * while it is "pending", and every decision replaces it.
+   */
+  suggestion?: { confirmation: AiConfirmation; status: SuggestionStatus };
 }
+
+/** Where a proposal stands. Only "pending" renders buttons. */
+type SuggestionStatus =
+  | "pending"
+  | "applied"
+  | "rejected"
+  | "writes_disabled"
+  | "stale"
+  | "invalid"
+  | "failed";
 
 /** Turns that stopped early rather than finishing, and what the user can do about it. */
 const INCOMPLETE_HINTS: Partial<Record<NonNullable<ChatMessage["stopReason"]>, string>> = {
@@ -66,7 +86,6 @@ export function ClaudeChat({
   const queryClient = useQueryClient();
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [draft, setDraft] = useState("");
-  const [confirmation, setConfirmation] = useState<AiConfirmation | null>(null);
   const endRef = useRef<HTMLDivElement | null>(null);
   /**
    * The account a request was sent for. A turn started on one account must not
@@ -97,7 +116,6 @@ export function ClaudeChat({
   // belong to the previous account and the numbers to a different business.
   useEffect(() => {
     setMessages([]);
-    setConfirmation(null);
   }, [accountId]);
 
   const busy = chat.isPending || confirm.isPending;
@@ -131,7 +149,13 @@ export function ClaudeChat({
             stopReason: response.stopReason,
             retryOf: message,
           });
-          if (response.confirmation) setConfirmation(response.confirmation);
+          if (response.confirmation) {
+            append({
+              role: "assistant",
+              content: "",
+              suggestion: { confirmation: response.confirmation, status: "pending" },
+            });
+          }
         },
         onError: (error) => {
           if (accountRef.current !== sentFor) return;
@@ -175,17 +199,32 @@ export function ClaudeChat({
     send(question, priorTurns);
   };
 
-  const resolveConfirmation = (decision: "approve" | "cancel"): void => {
-    if (accountId === null || confirmation === null) return;
-    const pending = confirmation;
+  const setSuggestionStatus = (messageId: string, status: SuggestionStatus): void => {
+    setMessages((current) =>
+      current.map((entry) =>
+        entry.id === messageId && entry.suggestion
+          ? { ...entry, suggestion: { ...entry.suggestion, status } }
+          : entry,
+      ),
+    );
+  };
+
+  const decide = (messageId: string, decision: "approve" | "cancel"): void => {
+    const entry = messages.find((message) => message.id === messageId);
+    // Guarding on "pending" is what makes a second approval impossible: the
+    // buttons are already gone, but a queued click or a replayed event cannot
+    // get past this either.
+    if (accountId === null || !entry?.suggestion || entry.suggestion.status !== "pending") return;
+
+    const pending = entry.suggestion.confirmation;
     const sentFor = accountId;
-    setConfirmation(null);
 
     confirm.mutate(
       { accountId, confirmationId: pending.id, decision },
       {
         onSuccess: (response) => {
           if (accountRef.current !== sentFor) return;
+          setSuggestionStatus(messageId, decision === "cancel" ? "rejected" : "applied");
           append({
             role: "assistant",
             content:
@@ -196,6 +235,17 @@ export function ClaudeChat({
         },
         onError: (error) => {
           if (accountRef.current !== sentFor) return;
+          const code = error instanceof ApiError ? error.code : null;
+          setSuggestionStatus(
+            messageId,
+            code === "ai_writes_disabled"
+              ? "writes_disabled"
+              : code === "ai_write_stale"
+                ? "stale"
+                : code === "ai_confirmation_expired"
+                  ? "invalid"
+                  : "failed",
+          );
           append({ role: "assistant", content: messageForError(error), isError: true });
         },
       },
@@ -261,10 +311,7 @@ export function ClaudeChat({
             <button
               type="button"
               disabled={busy}
-              onClick={() => {
-                setMessages([]);
-                setConfirmation(null);
-              }}
+              onClick={() => setMessages([])}
               className="rounded-lg border border-ink-700 bg-ink-800 px-3 py-1.5 text-xs text-ink-300 transition hover:border-ink-500 hover:text-ink-100 disabled:opacity-50"
             >
               Sohbeti temizle
@@ -296,13 +343,24 @@ export function ClaudeChat({
               </div>
             </div>
           ) : (
-            messages.map((message) => (
-              <Bubble
-                key={message.id}
-                message={message}
-                onRetry={message.retryOf && !busy ? () => retry(message.retryOf!) : undefined}
-              />
-            ))
+            messages.map((message) =>
+              message.suggestion ? (
+                <SuggestionCard
+                  key={message.id}
+                  confirmation={message.suggestion.confirmation}
+                  status={message.suggestion.status}
+                  busy={busy}
+                  onApprove={() => decide(message.id, "approve")}
+                  onReject={() => decide(message.id, "cancel")}
+                />
+              ) : (
+                <Bubble
+                  key={message.id}
+                  message={message}
+                  onRetry={message.retryOf && !busy ? () => retry(message.retryOf!) : undefined}
+                />
+              ),
+            )
           )}
 
           {chat.isPending ? <WorkingBubble /> : null}
@@ -349,13 +407,6 @@ export function ClaudeChat({
         </div>
       </Card>
 
-      {confirmation ? (
-        <ConfirmationDialog
-          confirmation={confirmation}
-          onCancel={() => resolveConfirmation("cancel")}
-          onApprove={() => resolveConfirmation("approve")}
-        />
-      ) : null}
     </div>
   );
 }
@@ -488,85 +539,162 @@ function ToolTraceList({ trace }: { trace: AiToolTrace[] }) {
   );
 }
 
-function ConfirmationDialog({
+/** How a decided proposal is labelled once the buttons are gone. */
+const SUGGESTION_STATUS: Record<
+  Exclude<SuggestionStatus, "pending">,
+  { label: string; tone: string; note: string }
+> = {
+  applied: {
+    label: "UYGULANDI",
+    tone: "border-positive-400/30 bg-positive-400/10 text-positive-400",
+    note: "Değişiklik Meta'ya gönderildi ve sonuç Meta'dan okunarak doğrulandı.",
+  },
+  rejected: {
+    label: "REDDEDİLDİ",
+    tone: "border-ink-700 bg-ink-800 text-ink-400",
+    note: "Öneri reddedildi. Meta'ya hiçbir istek gönderilmedi.",
+  },
+  writes_disabled: {
+    label: "YETKİ KAPALI",
+    tone: "border-warn-400/30 bg-warn-400/10 text-warn-400",
+    note: "Reklam değiştirme yetkisi bu sunucuda kapalı. Meta'ya hiçbir istek gönderilmedi.",
+  },
+  stale: {
+    label: "ÖNERİ GEÇERSİZ",
+    tone: "border-warn-400/30 bg-warn-400/10 text-warn-400",
+    note: "Bu nesne, öneri hazırlandıktan sonra Meta tarafında değişti. Hiçbir şey gönderilmedi — güncel değerlerle yeniden sorun.",
+  },
+  invalid: {
+    label: "ÖNERİ GEÇERSİZ",
+    tone: "border-warn-400/30 bg-warn-400/10 text-warn-400",
+    note: "Bu onay artık geçerli değil (süresi doldu ya da zaten kullanıldı). Değişikliği yeniden isteyin.",
+  },
+  failed: {
+    label: "BAŞARISIZ",
+    tone: "border-danger-400/30 bg-danger-400/10 text-danger-400",
+    note: "Meta isteği reddetti. Ayrıntı yukarıdaki mesajda.",
+  },
+};
+
+const CONFIDENCE_LABEL: Record<"low" | "medium" | "high", string> = {
+  low: "DÜŞÜK",
+  medium: "ORTA",
+  high: "YÜKSEK",
+};
+
+/**
+ * A proposed change, in the transcript rather than over it.
+ *
+ * It replaced a modal on purpose. A modal makes the decision feel like an
+ * interruption to be dismissed, hides the reasoning that produced it the
+ * moment it opens, and leaves nothing behind afterwards — so scrolling back
+ * through a conversation showed answers with no record of what was proposed or
+ * what was decided. As a card it sits next to the analysis it came from, and
+ * its own status is the record.
+ *
+ * The buttons render only while the status is "pending", which is what makes a
+ * second approval impossible from the UI; the server independently refuses a
+ * replayed id, and `decide` refuses a non-pending entry.
+ */
+function SuggestionCard({
   confirmation,
-  onCancel,
+  status,
+  busy,
   onApprove,
+  onReject,
 }: {
   confirmation: AiConfirmation;
-  onCancel: () => void;
+  status: SuggestionStatus;
+  busy: boolean;
   onApprove: () => void;
+  onReject: () => void;
 }) {
-  const titleId = useId();
-  const cancelRef = useRef<HTMLButtonElement>(null);
-
-  // Escape cancels, and focus lands on İPTAL rather than ONAYLA: the safe
-  // choice should be the one a stray Enter or a screen reader reaches first.
-  useEffect(() => {
-    cancelRef.current?.focus();
-    const onKeyDown = (event: KeyboardEvent): void => {
-      if (event.key === "Escape") onCancel();
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onCancel]);
+  const decided = status === "pending" ? null : SUGGESTION_STATUS[status];
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={titleId}
-        className="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl border border-ink-700 bg-ink-850 p-5"
-      >
-        <h3 id={titleId} className="text-sm font-semibold text-ink-100">
-          {confirmation.title}
-        </h3>
-        <p className="mt-1 text-xs text-ink-400">{confirmation.description}</p>
+    <article className="rounded-xl border border-ink-700 bg-ink-850">
+      <header className="flex flex-wrap items-center gap-2 border-b border-ink-700 px-4 py-2.5">
+        <span className="rounded-md border border-brand-500/40 bg-brand-500/10 px-2 py-0.5 text-[11px] font-semibold tracking-wide text-brand-400">
+          ÖNERİ
+        </span>
+        {decided ? (
+          <span className={`rounded-md border px-2 py-0.5 text-[11px] font-semibold tracking-wide ${decided.tone}`}>
+            {decided.label}
+          </span>
+        ) : (
+          <span className="rounded-md border border-ink-700 bg-ink-800 px-2 py-0.5 text-[11px] font-semibold tracking-wide text-ink-400">
+            BEKLİYOR
+          </span>
+        )}
+        {confirmation.confidence ? (
+          <span className="ml-auto text-[11px] text-ink-500">
+            Güven: <span className="text-ink-300">{CONFIDENCE_LABEL[confirmation.confidence]}</span>
+          </span>
+        ) : null}
+      </header>
 
-        <dl className="mt-4 space-y-2 rounded-lg border border-ink-700 bg-ink-800 p-3">
-          <div className="flex justify-between gap-3 text-xs">
-            <dt className="shrink-0 text-ink-500">Hesap</dt>
-            <dd className="text-right text-ink-100">{confirmation.accountName}</dd>
-          </div>
+      <div className="space-y-3 px-4 py-3">
+        <div>
+          <h3 className="text-sm font-semibold text-ink-100">{confirmation.title}</h3>
+          <p className="mt-0.5 text-xs text-ink-500">{confirmation.accountName}</p>
+        </div>
+
+        <dl className="space-y-1.5 rounded-lg border border-ink-700 bg-ink-800 p-3">
           {confirmation.fields.map((field, index) => (
-            <div key={`${field.label}-${index}`} className="flex justify-between gap-3 text-xs">
+            <div
+              key={`${field.label}-${index}`}
+              className="flex flex-col gap-0.5 text-xs sm:flex-row sm:justify-between sm:gap-3"
+            >
               <dt className="shrink-0 text-ink-500">{field.label}</dt>
-              <dd className="min-w-0 break-words text-right text-ink-100">{field.value}</dd>
+              <dd className="min-w-0 break-words text-ink-100 sm:text-right">{field.value}</dd>
             </div>
           ))}
         </dl>
 
         {confirmation.reason ? (
-          <div className="mt-3 rounded-lg border border-ink-700 bg-ink-800 p-3">
-            <p className="text-xs text-ink-500">Gerekçe</p>
-            <p className="mt-1 break-words text-xs text-ink-100">{confirmation.reason}</p>
+          <div>
+            <p className="text-[11px] font-semibold tracking-wide text-ink-500">GEREKÇE</p>
+            <p className="mt-1 break-words text-xs text-ink-300">{confirmation.reason}</p>
           </div>
         ) : null}
 
-        <p className="mt-3 text-xs text-ink-500">
-          Onaylayana kadar Meta'ya hiçbir istek gönderilmedi. Bu onay{" "}
-          {formatExpiry(confirmation.expiresAt)} geçerli.
-        </p>
+        {confirmation.risk ? (
+          <div>
+            <p className="text-[11px] font-semibold tracking-wide text-ink-500">RİSK</p>
+            <p className="mt-1 break-words text-xs text-ink-300">{confirmation.risk}</p>
+          </div>
+        ) : null}
 
-        <div className="mt-5 flex justify-end gap-2">
+        {decided ? (
+          <p className="text-xs text-ink-400">{decided.note}</p>
+        ) : (
+          <p className="text-xs text-ink-500">
+            Onaylayana kadar Meta'ya hiçbir istek gönderilmedi. Bu onay{" "}
+            {formatExpiry(confirmation.expiresAt)} geçerli.
+          </p>
+        )}
+      </div>
+
+      {status === "pending" ? (
+        <footer className="flex flex-col gap-2 border-t border-ink-700 px-4 py-3 sm:flex-row sm:justify-end">
           <button
-            ref={cancelRef}
             type="button"
-            onClick={onCancel}
-            className="rounded-lg border border-ink-700 bg-ink-800 px-4 py-2 text-sm font-medium text-ink-100 transition hover:border-ink-500"
+            onClick={onReject}
+            disabled={busy}
+            className="rounded-lg border border-ink-700 bg-ink-800 px-4 py-2 text-sm font-medium text-ink-100 transition hover:border-ink-500 disabled:opacity-50"
           >
-            İPTAL
+            Reddet
           </button>
           <button
             type="button"
             onClick={onApprove}
-            className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-brand-500"
+            disabled={busy}
+            className="rounded-lg bg-brand-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-brand-500 disabled:opacity-50"
           >
-            ONAYLA
+            Onayla ve Uygula
           </button>
-        </div>
-      </div>
-    </div>
+        </footer>
+      ) : null}
+    </article>
   );
 }

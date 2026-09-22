@@ -51,6 +51,8 @@ function samplePlan(overrides: Partial<WritePlan> = {}): WritePlan {
     title: "Kampanya güncellenecek",
     description: "Onaylarsanız bu değişiklik Meta'ya gönderilir.",
     reason: "Bütçe son 7 günde tükendi.",
+    risk: null,
+    confidence: null,
     fields: [
       { label: "Kampanya", value: "Kış Kampanyası" },
       { label: "Yeni günlük bütçe", value: "2.000,00 TRY" },
@@ -99,6 +101,11 @@ describe("the staged write store", () => {
     // The four things the user needs before approving: what changes, from what
     // to what, why, and how long the approval stays good for.
     expect(confirmation.reason).toBe("Bütçe son 7 günde tükendi.");
+    // risk and confidence are optional: a proposal that did not come from a
+    // finding carries null rather than an invented level, and the card simply
+    // omits those rows.
+    expect(confirmation.risk).toBeNull();
+    expect(confirmation.confidence).toBeNull();
     expect(confirmation.fields[1].value).toContain("2.000,00 TRY");
     expect(confirmation.expiresAt).toBeGreaterThan(Date.now());
     // Nothing the browser receives says what would actually be sent to Meta.

@@ -77,6 +77,8 @@ export function stageWrite(input: StageInput, now = Date.now()): PendingConfirma
     title: input.plan.title,
     description: input.plan.description,
     reason: input.plan.reason,
+    risk: input.plan.risk,
+    confidence: input.plan.confidence,
     fields: input.plan.fields,
     accountName: input.accountName,
     expiresAt,

@@ -194,6 +194,10 @@ export interface AiConfirmation {
   description: string;
   /** Why the assistant is proposing the change. Plain text, never HTML. */
   reason: string;
+  /** What could go wrong. Null when the model did not supply one. */
+  risk: string | null;
+  /** How well the data supports acting. Null when it did not come from a finding. */
+  confidence: "low" | "medium" | "high" | null;
   fields: Array<{ label: string; value: string }>;
   accountName: string;
   expiresAt: number;
