@@ -41,7 +41,7 @@ const ACCOUNT: AdAccountDto = {
   businessName: "Acme Holding",
 };
 
-const CTX = { fbUserId: "1000000000001", tokenHash: "abc123def456" };
+const CTX = { fbUserId: "1000000000001", tokenHash: "fixturehash1" };
 const OWNER = { fbUserId: CTX.fbUserId, accountId: ACCOUNT.id };
 
 function samplePlan(overrides: Partial<WritePlan> = {}): WritePlan {

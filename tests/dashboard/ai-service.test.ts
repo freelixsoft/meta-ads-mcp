@@ -34,7 +34,7 @@ import type { AiRequestInput } from "../../src/dashboard/schemas.js";
 
 const META_TOKEN = "EAAtest_never_leaves_the_server_0123456789";
 
-const CTX = { fbUserId: "1000000000001", tokenHash: "abc123def456" };
+const CTX = { fbUserId: "1000000000001", tokenHash: "fixturehash1" };
 
 const ACCOUNT: AdAccountDto = {
   id: "act_111",

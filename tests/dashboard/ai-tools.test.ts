@@ -44,7 +44,7 @@ const ACCOUNT: AdAccountDto = {
 };
 
 const TOOLS: ToolExecutionContext = {
-  ctx: { fbUserId: "1000000000001", tokenHash: "abc123def456" },
+  ctx: { fbUserId: "1000000000001", tokenHash: "fixturehash1" },
   account: ACCOUNT,
 };
 
