@@ -407,13 +407,18 @@ describe("the confirmation round trip", () => {
 
   it("sends the change to Meta only after an explicit approval", async () => {
     const { id } = await proposeChange();
-    metaGetMock.mockResolvedValue({
-      id: "100",
-      name: "Kış Kampanyası",
-      status: "ACTIVE",
-      effective_status: "ACTIVE",
-      daily_budget: "200000",
-    });
+    // applyWritePlan reads twice: once before the write to check the object
+    // has not moved since the proposal, then again afterwards to report what
+    // Meta stored. The first must still show the pre-write budget.
+    metaGetMock
+      .mockResolvedValueOnce({ id: "100", name: "Kış Kampanyası", daily_budget: "25000" })
+      .mockResolvedValue({
+        id: "100",
+        name: "Kış Kampanyası",
+        status: "ACTIVE",
+        effective_status: "ACTIVE",
+        daily_budget: "200000",
+      });
 
     const response = await post("/api/dashboard/accounts/act_111/ai/confirm", {
       body: { confirmationId: id, decision: "approve" },

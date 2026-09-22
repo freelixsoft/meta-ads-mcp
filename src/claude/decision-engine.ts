@@ -50,6 +50,22 @@ export type FindingKind =
  */
 export type BudgetOwner = "campaign" | "adset" | "unknown";
 
+/** The operation a finding is asking a human to approve. */
+export type ActionType =
+  | "PAUSE_AD"
+  | "PAUSE_ADSET"
+  | "PAUSE_CAMPAIGN"
+  | "CHANGE_ADSET_BUDGET"
+  | "CHANGE_CAMPAIGN_BUDGET"
+  /** Something to look at. No write exists for it, by design. */
+  | "INVESTIGATE";
+
+const PAUSE_BY_LEVEL: Record<Exclude<EntityLevel, "account">, ActionType> = {
+  campaign: "PAUSE_CAMPAIGN",
+  adset: "PAUSE_ADSET",
+  ad: "PAUSE_AD",
+};
+
 /** One finding, in the shape the confirmation-style answer is built from. */
 export interface Finding {
   kind: FindingKind;
@@ -77,6 +93,20 @@ export interface Finding {
   action: string;
   goal: string;
   risk: string;
+  /**
+   * The operation a reviewer is being asked to approve, as an enum rather than
+   * prose, so a UI can group and colour recommendations without parsing
+   * Turkish. `INVESTIGATE` is the honest answer when the finding is something
+   * to look at rather than something to change.
+   */
+  actionType: ActionType;
+  /**
+   * How much the data behind this supports acting on it. Derived, not felt:
+   * `high` needs both a material share of the period's spend and — where the
+   * signal is a trend — two periods that both carried a real number. Nothing
+   * here is a score to rank by; the ordering is still money at stake.
+   */
+  confidence: "low" | "medium" | "high";
   /** The write tool that would carry it out, or null when none applies. */
   writeTool: "meta_update_campaign" | "meta_update_ad_set" | "meta_update_ad" | null;
   /** Spend at stake in the period. The ordering key — a real number, not a score. */
@@ -113,6 +143,14 @@ const HIGH_ROAS_RATIO = 1.5;
  * the engine does not propose it.
  */
 const DOMINANT_SPEND_SHARE = 0.5;
+
+/**
+ * Below this many purchases a high ROAS is a small sample, not a result. Three
+ * is where a single refund or a single lucky order stops being able to move
+ * the ratio on its own; the engine will still surface the finding, it just
+ * will not call it high confidence.
+ */
+const MIN_PURCHASES_FOR_HIGH_CONFIDENCE = 3;
 
 export interface EngineInput {
   level: Exclude<EntityLevel, "account">;
@@ -278,12 +316,52 @@ export function metricLineOf(row: EntityRowDto): Record<string, number | null> {
   };
 }
 
+function actionTypeFor(
+  kind: FindingKind,
+  level: Exclude<EntityLevel, "account">,
+  owner: BudgetOwner,
+): ActionType {
+  if (kind === "zero_conversion_spend" || kind === "low_roas") return PAUSE_BY_LEVEL[level];
+  if (kind === "high_roas_underfunded") {
+    if (owner === "campaign") return "CHANGE_CAMPAIGN_BUDGET";
+    if (owner === "adset") return "CHANGE_ADSET_BUDGET";
+    return "INVESTIGATE";
+  }
+  return "INVESTIGATE";
+}
+
+/**
+ * How well the data supports acting, from the data alone.
+ *
+ * The share of the period's spend does most of the work: a finding on 2% of
+ * the budget is a weaker basis for a decision than the same finding on 40% of
+ * it, whatever the rates say. The one override is the small-sample trap — a
+ * spectacular ROAS off two or three purchases is noise wearing a suit, and
+ * calling that "high" is how a dashboard talks someone into scaling a fluke.
+ */
+function confidenceFor(kind: FindingKind, row: EntityRowDto, ctx: Ctx): Finding["confidence"] {
+  const spend = row.metrics.spend ?? 0;
+  const share = ctx.baselines.totalSpend > 0 ? spend / ctx.baselines.totalSpend : 0;
+
+  let level: Finding["confidence"] =
+    share >= MATERIAL_SPEND_SHARE * 2 ? "high" : share >= MATERIAL_SPEND_SHARE ? "medium" : "low";
+
+  const purchases = row.metrics.purchases ?? 0;
+  if (kind === "high_roas_underfunded" && purchases < MIN_PURCHASES_FOR_HIGH_CONFIDENCE) {
+    level = level === "high" ? "medium" : "low";
+  }
+  return level;
+}
+
 function baseFinding(
   row: EntityRowDto,
   kind: FindingKind,
   ctx: Ctx,
 ): Omit<Finding, "evidence" | "action" | "goal" | "risk" | "writeTool" | "priorityBasis" | "facts"> {
+  const owner = budgetOwnerOf(row, ctx.cboCampaignIds);
   return {
+    actionType: actionTypeFor(kind, row.level as Exclude<EntityLevel, "account">, owner),
+    confidence: confidenceFor(kind, row, ctx),
     metrics: metricLineOf(row),
     kind,
     level: row.level,
@@ -616,6 +694,7 @@ export function analyze(input: EngineInput): EngineResult {
 }
 
 export {
+  MIN_PURCHASES_FOR_HIGH_CONFIDENCE,
   MATERIAL_CHANGE_PCT,
   MATERIAL_SPEND_SHARE,
   LOW_ROAS_RATIO,

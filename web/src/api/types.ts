@@ -108,6 +108,8 @@ export type ApiErrorCode =
   | "ai_rate_limited"
   | "ai_unavailable"
   | "ai_confirmation_expired"
+  | "ai_write_stale"
+  | "ai_writes_disabled"
   /**
    * Client-side only: the request never reached the server. The server never
    * sends this code — `apiGet`/`apiPost` raise it when fetch itself rejects,

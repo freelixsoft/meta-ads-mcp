@@ -10,6 +10,7 @@ import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middlew
 import { oauthProvider } from "../auth/oauth-provider.js";
 import { isApiKeyConfigured, validateApiKey } from "../auth/api-key.js";
 import { hashPii, requestContext } from "../auth/token-store.js";
+import { configureAuditLog, FirestoreAuditLog, InMemoryAuditLog } from "../store/audit-log.js";
 import { tokenManager } from "../auth/token-manager.js";
 import { configureSessionJtiStore, getSession } from "../auth/session.js";
 import { resolveSecurityConfig } from "./security-config.js";
@@ -537,6 +538,7 @@ export async function startHttpTransport(
       });
       configureSessionJtiStore(new InMemoryJtiStore());
       configureMetaTokenRepo(new InMemoryMetaTokenRepo());
+      configureAuditLog(new InMemoryAuditLog());
     } else {
       oauthProvider.configure({
         clientsStore: new FirestoreClientsStore(),
@@ -546,6 +548,7 @@ export async function startHttpTransport(
       });
       configureSessionJtiStore(new FirestoreJtiStore("mcp_session_jti"));
       configureMetaTokenRepo(new FirestoreMetaTokenRepo());
+      configureAuditLog(new FirestoreAuditLog());
     }
   }
 

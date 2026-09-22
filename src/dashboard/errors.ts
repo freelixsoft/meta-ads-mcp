@@ -23,7 +23,15 @@ export type DashboardErrorCode =
   | "ai_rate_limited"
   | "ai_unavailable"
   /** A staged write was approved too late, twice, or by the wrong session. */
-  | "ai_confirmation_expired";
+  | "ai_confirmation_expired"
+  /**
+   * The object moved between the proposal and the approval, so the change was
+   * refused rather than applied on top of someone else's edit. Distinct from
+   * `ai_confirmation_expired`: the approval was valid, the world was not.
+   */
+  | "ai_write_stale"
+  /** The operator kill switch is off, so an approved write was declined. */
+  | "ai_writes_disabled";
 
 export class DashboardError extends Error {
   constructor(

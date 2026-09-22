@@ -76,6 +76,10 @@ export const ERROR_MESSAGES: Record<ApiErrorCode, string> = {
   ai_unavailable: "Claude şu anda yanıt veremedi. Biraz sonra tekrar deneyin.",
   ai_confirmation_expired:
     "Bu onay artık geçerli değil (süresi doldu ya da kullanıldı). İşlemi yeniden isteyin.",
+  ai_write_stale:
+    "Bu nesne, oneri hazirlandiktan sonra Meta tarafinda degisti. Hicbir sey gonderilmedi — guncel degerlerle yeniden sorun.",
+  ai_writes_disabled:
+    "Reklam degistirme yetkisi bu sunucuda kapali. Oneri hazirlandi ama Meta’ya hicbir istek gonderilmedi.",
   network_error: "Sunucuya ulaşılamadı. İnternet bağlantınızı kontrol edip tekrar deneyin.",
 };
 

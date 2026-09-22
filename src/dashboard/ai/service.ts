@@ -2,11 +2,12 @@ import { hashPii } from "../../auth/token-store.js";
 import { logger } from "../../utils/logger.js";
 import { runAgent } from "../../claude/agent.js";
 import { ClaudeError } from "../../claude/client.js";
-import { takeWrite } from "../../claude/confirmations.js";
-import { applyWritePlan } from "../../claude/tools.js";
+import { discardWrite, takeWrite } from "../../claude/confirmations.js";
+import { applyWritePlan, StaleWriteError, type WritePlan } from "../../claude/tools.js";
 import type { ChatTurn } from "../../claude/types.js";
 import { invalidateTenantCache } from "../cache.js";
-import { DashboardError } from "../errors.js";
+import { DashboardError, toDashboardError } from "../errors.js";
+import { recordAudit, type AuditEntry } from "../../store/audit-log.js";
 import type {
   AdAccountDto,
   AiAnalysisResponseDto,
@@ -362,16 +363,56 @@ const APPLIED_MESSAGE: Record<string, string> = {
  * only once, and only inside its ten-minute window. This is the single place in
  * the dashboard where a request reaches Meta with a method other than GET.
  */
+/** The audit shape of one plan, before we know what happened to it. */
+function auditOf(
+  plan: WritePlan,
+  accountId: string,
+  accountName: string,
+  fbUserId: string,
+): Omit<AuditEntry, "outcome" | "verified" | "errorCode"> {
+  return {
+    at: new Date().toISOString(),
+    userHash: hashPii(fbUserId),
+    accountId,
+    accountName,
+    tool: plan.tool,
+    level: plan.verify.level,
+    objectId: plan.verify.id,
+    objectName: plan.fields[0]?.value ?? null,
+    before: plan.expected,
+    after: plan.body,
+    reason: plan.reason,
+  };
+}
+
 export async function applyDashboardConfirmation(
   ctx: DashboardContext,
   account: AdAccountDto,
   confirmationId: string,
 ): Promise<AiConfirmResponseDto> {
+  const owner = { fbUserId: ctx.fbUserId, accountId: account.id };
+
+  // The kill switch is checked before the plan is claimed, so an operator who
+  // turns writes off does not also consume the user's pending confirmation:
+  // turning them back on leaves it usable rather than mysteriously gone.
   if (!writesEnabled()) {
-    throw new DashboardError("invalid_request", 403, "Changes are disabled on this server.");
+    const staged = discardWrite(confirmationId, owner);
+    if (staged) {
+      await recordAudit(ctx.fbUserId, {
+        ...auditOf(staged.plan, account.id, staged.accountName, ctx.fbUserId),
+        outcome: "refused_writes_disabled",
+        verified: null,
+        errorCode: "writes_disabled",
+      });
+    }
+    throw new DashboardError(
+      "ai_writes_disabled",
+      403,
+      "Reklam değiştirme yetkisi bu sunucuda kapalı. Öneri hazırlandı ama Meta'ya hiçbir istek gönderilmedi.",
+    );
   }
 
-  const claimed = takeWrite(confirmationId, { fbUserId: ctx.fbUserId, accountId: account.id });
+  const claimed = takeWrite(confirmationId, owner);
   if (!claimed.ok) {
     throw new DashboardError(
       "ai_confirmation_expired",
@@ -380,10 +421,18 @@ export async function applyDashboardConfirmation(
     );
   }
 
+  const base = auditOf(claimed.plan, account.id, account.name, ctx.fbUserId);
+
   let applied;
   try {
     applied = await applyWritePlan(claimed.plan);
   } catch (error) {
+    await recordAudit(ctx.fbUserId, {
+      ...base,
+      outcome: error instanceof StaleWriteError ? "refused_stale" : "failed",
+      verified: null,
+      errorCode: toDashboardError(error).code,
+    });
     logger.error(
       {
         event: "dashboard_ai_write_failed",
@@ -416,13 +465,20 @@ export async function applyDashboardConfirmation(
     "Confirmed Meta write applied",
   );
 
-  const base = APPLIED_MESSAGE[claimed.plan.tool] ?? "İşlem tamamlandı.";
+  await recordAudit(ctx.fbUserId, {
+    ...base,
+    outcome: "applied",
+    verified: applied.verified,
+    errorCode: null,
+  });
+
+  const message = APPLIED_MESSAGE[claimed.plan.tool] ?? "İşlem tamamlandı.";
   return {
     applied: true,
     title: sanitizeLine(claimed.title, 200),
     answer: applied.verificationFailed
-      ? `${base} Ancak sonucu Meta'dan doğrulayamadım; Ads Manager'dan kontrol edin.`
-      : base,
+      ? `${message} Ancak sonucu Meta'dan doğrulayamadım; Ads Manager'dan kontrol edin.`
+      : message,
     verified: applied.verified,
     verificationFailed: applied.verificationFailed,
     generatedAt: new Date().toISOString(),

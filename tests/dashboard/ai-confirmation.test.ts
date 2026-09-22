@@ -26,6 +26,7 @@ const { stageWrite, takeWrite, discardWrite, clearPendingWrites, pendingWriteCou
 const { applyDashboardConfirmation } = await import("../../src/dashboard/ai/service.js");
 const { DashboardError } = await import("../../src/dashboard/errors.js");
 const { cacheKey, dashboardCache } = await import("../../src/dashboard/cache.js");
+const { configureAuditLog, getAuditLog, InMemoryAuditLog } = await import("../../src/store/audit-log.js");
 
 import type { WritePlan } from "../../src/claude/tools.js";
 import type { AdAccountDto } from "../../src/dashboard/dto.js";
@@ -56,6 +57,7 @@ function samplePlan(overrides: Partial<WritePlan> = {}): WritePlan {
     ],
     path: "/100",
     body: { daily_budget: "200000" },
+    expected: { daily_budget: 2000 },
     verify: { kind: "existing", id: "100", level: "campaign" },
     ...overrides,
   };
@@ -71,6 +73,7 @@ function stage(plan = samplePlan(), owner = OWNER, now?: number) {
 beforeEach(() => {
   clearPendingWrites();
   dashboardCache.clear();
+  configureAuditLog(new InMemoryAuditLog());
   delete process.env.DASHBOARD_AI_WRITES;
   metaPostFormMock.mockResolvedValue({ success: true });
   metaGetMock.mockResolvedValue({
@@ -145,8 +148,8 @@ describe("the staged write store", () => {
 
   it("discards a plan outright, and refuses to discard someone else's", () => {
     const confirmation = stage();
-    expect(discardWrite(confirmation.id, { fbUserId: "9999", accountId: ACCOUNT.id })).toBe(false);
-    expect(discardWrite(confirmation.id, OWNER)).toBe(true);
+    expect(discardWrite(confirmation.id, { fbUserId: "9999", accountId: ACCOUNT.id })).toBeNull();
+    expect(discardWrite(confirmation.id, OWNER)?.plan.tool).toBe("meta_update_campaign");
     expect(pendingWriteCount()).toBe(0);
   });
 });
@@ -233,7 +236,11 @@ describe("applyDashboardConfirmation", () => {
   });
 
   it("says so when the write landed but the read-back did not", async () => {
-    metaGetMock.mockRejectedValue(new Error("Meta read failed"));
+    // The pre-write drift check reads first and must succeed; it is the
+    // read-BACK, after the write, that fails in this case.
+    metaGetMock
+      .mockResolvedValueOnce({ id: "100", daily_budget: "200000" })
+      .mockRejectedValue(new Error("Meta read failed"));
     const confirmation = stage();
 
     const result = await applyDashboardConfirmation(CTX, ACCOUNT, confirmation.id);
@@ -268,6 +275,86 @@ describe("applyDashboardConfirmation", () => {
     expect(metaPostFormMock).not.toHaveBeenCalled();
   });
 
+  // ─── F: the object moved between the proposal and the approval ──────────
+  it("refuses to write over a change someone else made in the meantime", async () => {
+    // Meta now holds 3.000 TRY, not the 2.000 the plan was built against.
+    metaGetMock.mockResolvedValue({
+      id: "100",
+      name: "Kış Kampanyası",
+      status: "ACTIVE",
+      effective_status: "ACTIVE",
+      daily_budget: "300000",
+    });
+
+    await expect(applyDashboardConfirmation(CTX, ACCOUNT, stage().id)).rejects.toMatchObject({
+      code: "ai_write_stale",
+      status: 409,
+    });
+    // The point of checking first: nothing was sent.
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+
+  it("records the refusal, with the value it expected and the one it found", async () => {
+    metaGetMock.mockResolvedValue({ id: "100", daily_budget: "300000" });
+    await applyDashboardConfirmation(CTX, ACCOUNT, stage().id).catch(() => undefined);
+
+    const entries = await getAuditLog().list(CTX.fbUserId);
+    expect(entries[0]).toMatchObject({
+      outcome: "refused_stale",
+      tool: "meta_update_campaign",
+      objectId: "100",
+      before: { daily_budget: 2000 },
+      after: { daily_budget: "200000" },
+    });
+  });
+
+  it("still applies when an unrelated field moved", async () => {
+    // The name changed; the plan only writes the budget, so it is not blocked.
+    metaGetMock.mockResolvedValue({
+      id: "100",
+      name: "Kış Kampanyası (yeni ad)",
+      status: "ACTIVE",
+      daily_budget: "200000",
+    });
+
+    const result = await applyDashboardConfirmation(CTX, ACCOUNT, stage().id);
+    expect(result.applied).toBe(true);
+    expect(metaPostFormMock).toHaveBeenCalledTimes(1);
+  });
+
+  // ─── Audit trail ────────────────────────────────────────────────────────
+  it("records an applied write with the before, the after and the AI's reason", async () => {
+    await applyDashboardConfirmation(CTX, ACCOUNT, stage().id);
+
+    const entries = await getAuditLog().list(CTX.fbUserId);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({
+      outcome: "applied",
+      accountId: ACCOUNT.id,
+      accountName: ACCOUNT.name,
+      tool: "meta_update_campaign",
+      level: "campaign",
+      objectId: "100",
+      before: { daily_budget: 2000 },
+      after: { daily_budget: "200000" },
+      reason: "Bütçe son 7 günde tükendi.",
+      errorCode: null,
+    });
+    expect(entries[0].verified).toMatchObject({ dailyBudget: 2000 });
+    // The tenant is identified by the path, so the payload keeps only a hash.
+    expect(entries[0].userHash).not.toBe(CTX.fbUserId);
+    expect(entries[0].at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it("records a Meta failure as failed, not as applied", async () => {
+    metaPostFormMock.mockRejectedValueOnce(new Error("Meta rejected the write"));
+    await applyDashboardConfirmation(CTX, ACCOUNT, stage().id).catch(() => undefined);
+
+    const entries = await getAuditLog().list(CTX.fbUserId);
+    expect(entries[0]?.outcome).toBe("failed");
+    expect(entries[0]?.verified).toBeNull();
+  });
+
   it("refuses every write when the operator switched writes off", async () => {
     process.env.DASHBOARD_AI_WRITES = "off";
     const confirmation = stage();
@@ -275,6 +362,73 @@ describe("applyDashboardConfirmation", () => {
     await expect(applyDashboardConfirmation(CTX, ACCOUNT, confirmation.id)).rejects.toMatchObject({
       status: 403,
     });
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+    // Not even the pre-write read: the switch is checked before anything else.
+    expect(metaGetMock).not.toHaveBeenCalled();
+  });
+
+  it("tells the user why, in Turkish, when writes are switched off", async () => {
+    process.env.DASHBOARD_AI_WRITES = "off";
+
+    const error = await applyDashboardConfirmation(CTX, ACCOUNT, stage().id).catch(
+      (caught: unknown) => caught as InstanceType<typeof DashboardError>,
+    );
+    expect(error.message).toContain("Reklam değiştirme yetkisi");
+    expect(error.message).toContain("hiçbir istek gönderilmedi");
+  });
+
+  it("records the refusal and leaves the confirmation unusable", async () => {
+    process.env.DASHBOARD_AI_WRITES = "off";
+    const confirmation = stage();
+
+    await applyDashboardConfirmation(CTX, ACCOUNT, confirmation.id).catch(() => undefined);
+
+    const entries = await getAuditLog().list(CTX.fbUserId);
+    expect(entries[0]).toMatchObject({
+      outcome: "refused_writes_disabled",
+      errorCode: "writes_disabled",
+      tool: "meta_update_campaign",
+    });
+    expect(pendingWriteCount()).toBe(0);
+  });
+
+  // ─── G: an approval aimed at the wrong ad account ───────────────────────
+  it("refuses an approval presented against a different ad account", async () => {
+    const confirmation = stage();
+    const otherAccount = { ...ACCOUNT, id: "act_222", accountId: "222", name: "Başka Hesap" };
+
+    await expect(
+      applyDashboardConfirmation(CTX, otherAccount, confirmation.id),
+    ).rejects.toMatchObject({ code: "ai_confirmation_expired" });
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+    // And the real owner's confirmation was not consumed by the attempt.
+    expect(pendingWriteCount()).toBe(1);
+  });
+
+  it("records the rejection when the user cancels", async () => {
+    const confirmation = stage();
+    const staged = discardWrite(confirmation.id, OWNER);
+    expect(staged).not.toBeNull();
+
+    await getAuditLog().record(CTX.fbUserId, {
+      at: new Date().toISOString(),
+      userHash: null,
+      accountId: ACCOUNT.id,
+      accountName: ACCOUNT.name,
+      tool: staged!.plan.tool,
+      level: staged!.plan.verify.level,
+      objectId: staged!.plan.verify.id,
+      objectName: staged!.plan.fields[0]?.value ?? null,
+      before: staged!.plan.expected,
+      after: staged!.plan.body,
+      reason: staged!.plan.reason,
+      outcome: "rejected",
+      verified: null,
+      errorCode: null,
+    });
+
+    const entries = await getAuditLog().list(CTX.fbUserId);
+    expect(entries[0]?.outcome).toBe("rejected");
     expect(metaPostFormMock).not.toHaveBeenCalled();
   });
 

@@ -112,12 +112,21 @@ export function takeWrite(
   return { ok: true, plan: entry.plan, title: entry.title };
 }
 
-/** Discards a staged write outright — what the Cancel button does. */
-export function discardWrite(id: string, owner: { fbUserId: string; accountId: string }): boolean {
+/**
+ * Discards a staged write outright — what the Cancel button does.
+ *
+ * Returns the plan it discarded so the caller can record the rejection. A
+ * proposal the user turned down is evidence about the assistant's judgement,
+ * and an audit trail that keeps only the approvals flatters it.
+ */
+export function discardWrite(
+  id: string,
+  owner: { fbUserId: string; accountId: string },
+): { plan: WritePlan; accountName: string } | null {
   const entry = pending.get(id);
-  if (!entry || entry.fbUserId !== owner.fbUserId || entry.accountId !== owner.accountId) return false;
+  if (!entry || entry.fbUserId !== owner.fbUserId || entry.accountId !== owner.accountId) return null;
   pending.delete(id);
-  return true;
+  return { plan: entry.plan, accountName: entry.accountName };
 }
 
 /** Test helper; never called by the server. */

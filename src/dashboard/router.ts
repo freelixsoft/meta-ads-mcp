@@ -34,6 +34,7 @@ import {
   runDashboardChat,
 } from "./ai/service.js";
 import { discardWrite } from "../claude/confirmations.js";
+import { recordAudit } from "../store/audit-log.js";
 import { authorizeAccount, listAccessibleAccounts, type DashboardContext } from "./services/accounts.js";
 import { getCampaignsWithMetrics } from "./services/campaigns.js";
 import {
@@ -313,11 +314,31 @@ export function createDashboardApiRouter(serverUrl: URL): express.Router {
       const input = aiConfirmSchema.parse(bodyOf(req));
 
       if (input.decision === "cancel") {
-        const discarded = discardWrite(input.confirmationId, {
+        const staged = discardWrite(input.confirmationId, {
           fbUserId: ctx.fbUserId,
           accountId: account.id,
         });
-        res.json({ applied: false, discarded });
+        // A proposal the user turned down is evidence about the assistant's
+        // judgement; a trail that keeps only the approvals flatters it.
+        if (staged) {
+          await recordAudit(ctx.fbUserId, {
+            at: new Date().toISOString(),
+            userHash: hashPii(ctx.fbUserId),
+            accountId: account.id,
+            accountName: staged.accountName,
+            tool: staged.plan.tool,
+            level: staged.plan.verify.level,
+            objectId: staged.plan.verify.id,
+            objectName: staged.plan.fields[0]?.value ?? null,
+            before: staged.plan.expected,
+            after: staged.plan.body,
+            reason: staged.plan.reason,
+            outcome: "rejected",
+            verified: null,
+            errorCode: null,
+          });
+        }
+        res.json({ applied: false, discarded: staged !== null });
         return;
       }
 

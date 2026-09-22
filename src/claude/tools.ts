@@ -569,6 +569,21 @@ export interface WritePlan {
   body: Record<string, string>;
   /** Object to re-read after the write, to verify what actually landed. */
   verify: { kind: "created" | "existing"; id: string | null; level: "campaign" | "adset" | "ad" };
+  /**
+   * What the fields this plan changes looked like when it was proposed.
+   *
+   * A confirmation can sit for ten minutes, and in that window someone else —
+   * a colleague in Ads Manager, another session, an automated rule — can move
+   * the same budget or flip the same status. Applying the plan blind would
+   * silently overwrite their change with a number the user approved against a
+   * world that no longer exists. Checked against a fresh read immediately
+   * before the write; a mismatch aborts instead of guessing which value wins.
+   *
+   * Only the keys this plan actually writes are recorded, so an unrelated
+   * edit elsewhere on the object does not block it. Empty for creations,
+   * which have nothing to have drifted.
+   */
+  expected: Record<string, string | number | null>;
 }
 
 export interface WriteTool<S extends z.ZodType = z.ZodType> {
@@ -686,6 +701,22 @@ function refuseAdSetBudgetUnderCbo(campaign: EntityRef, currency: string): never
   );
 }
 
+/**
+ * The current value of exactly the fields a plan is about to write.
+ *
+ * Keyed by the Meta form field so the comparison at apply time is against the
+ * same names the write uses, and narrowed to the keys in `body` so an edit to
+ * some unrelated part of the object never blocks an approved change.
+ */
+function snapshotOf(ref: EntityRef, body: Record<string, string>): Record<string, string | number | null> {
+  const out: Record<string, string | number | null> = {};
+  if ("name" in body) out.name = ref.name;
+  if ("status" in body) out.status = ref.status;
+  if ("daily_budget" in body) out.daily_budget = ref.dailyBudget;
+  if ("lifetime_budget" in body) out.lifetime_budget = ref.lifetimeBudget;
+  return out;
+}
+
 /** Budget rules are Meta's, not ours: exactly one of daily/lifetime, never both. */
 function assertSingleBudget(daily?: number, lifetime?: number): void {
   if (daily !== undefined && lifetime !== undefined) {
@@ -742,6 +773,7 @@ export const WRITE_TOOLS: WriteTool[] = [
         fields,
         path: `/${tools.account.id}/campaigns`,
         body,
+        expected: {},
         verify: { kind: "created", id: null, level: "campaign" },
       };
     },
@@ -794,6 +826,7 @@ export const WRITE_TOOLS: WriteTool[] = [
         fields,
         path: `/${campaign.id}`,
         body,
+        expected: snapshotOf(campaign, body),
         verify: { kind: "existing", id: campaign.id, level: "campaign" },
       };
     },
@@ -887,6 +920,7 @@ export const WRITE_TOOLS: WriteTool[] = [
         fields,
         path: `/${tools.account.id}/adsets`,
         body,
+        expected: {},
         verify: { kind: "created", id: null, level: "adset" },
       };
     },
@@ -949,6 +983,7 @@ export const WRITE_TOOLS: WriteTool[] = [
         fields,
         path: `/${adSet.id}`,
         body,
+        expected: snapshotOf(adSet, body),
         verify: { kind: "existing", id: adSet.id, level: "adset" },
       };
     },
@@ -986,6 +1021,7 @@ export const WRITE_TOOLS: WriteTool[] = [
           status,
           creative: JSON.stringify({ creative_id: input.creativeId }),
         },
+        expected: {},
         verify: { kind: "created", id: null, level: "ad" },
       };
     },
@@ -1023,6 +1059,7 @@ export const WRITE_TOOLS: WriteTool[] = [
         fields,
         path: `/${ad.id}`,
         body,
+        expected: snapshotOf(ad, body),
         verify: { kind: "existing", id: ad.id, level: "ad" },
       };
     },
@@ -1041,11 +1078,58 @@ const VERIFY_FIELDS = "id,name,status,effective_status,daily_budget,lifetime_bud
  * WITH_ISSUES). Reporting the echoed request instead of the stored object would
  * tell the user something that is not true.
  */
+export class StaleWriteError extends DashboardError {
+  constructor(
+    readonly field: string,
+    readonly approved: string | number | null,
+    readonly current: string | number | null,
+  ) {
+    super(
+      "ai_write_stale",
+      409,
+      "Bu nesne, öneri hazırlandıktan sonra Meta tarafında değişti. Hiçbir şey gönderilmedi — " +
+        "güncel değerlerle yeniden sorun.",
+    );
+  }
+}
+
+/** Is what Meta holds now still what the user approved against? */
+function driftOf(
+  expected: Record<string, string | number | null>,
+  fresh: Record<string, unknown>,
+): { field: string; approved: string | number | null; current: string | number | null } | null {
+  for (const [field, approved] of Object.entries(expected)) {
+    const raw = fresh[field];
+    // Budgets come back in minor units; the snapshot holds major, like the UI.
+    const current =
+      field === "daily_budget" || field === "lifetime_budget"
+        ? minorToMajor(raw)
+        : typeof raw === "string"
+          ? raw
+          : null;
+    if (current !== approved) return { field, approved, current };
+  }
+  return null;
+}
+
 export async function applyWritePlan(plan: WritePlan): Promise<{
   id: string | null;
   verified: Record<string, string | number | boolean | null>;
   verificationFailed: boolean;
 }> {
+  // Re-read before writing, not after. An approval can be ten minutes old, and
+  // in that window a colleague in Ads Manager, another session or an automated
+  // rule can have moved the same budget. Writing blind would overwrite their
+  // change with a number the user approved against a world that no longer
+  // exists — so a mismatch stops here, before anything is sent.
+  if (plan.verify.kind === "existing" && plan.verify.id && Object.keys(plan.expected).length > 0) {
+    const current = await metaApiClient.get<Record<string, unknown>>(`/${plan.verify.id}`, {
+      fields: VERIFY_FIELDS,
+    });
+    const drift = driftOf(plan.expected, current);
+    if (drift) throw new StaleWriteError(drift.field, drift.approved, drift.current);
+  }
+
   const result = await metaApiClient.postForm<{ id?: string; success?: boolean }>(plan.path, plan.body);
   const id = plan.verify.kind === "created" ? (result.id ?? null) : plan.verify.id;
   if (!id) return { id: null, verified: {}, verificationFailed: true };
