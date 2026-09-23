@@ -311,3 +311,62 @@ describe("the prompt routes the dashboard's own example questions", () => {
     expect(prompt).toContain("Do not call a write tool unless the user asked you to");
   });
 });
+
+/**
+ * How a diagnosis is allowed to be worded.
+ *
+ * The arithmetic behind it is sound and none of it changes here. What these
+ * rules govern is the sentence built on top of it: an association is what was
+ * measured, and a sentence claiming a cause reports something that was never
+ * computed. The distinction survives only if it is written down, so it is.
+ */
+describe("the prompt keeps a diagnosis to what was measured", () => {
+  const prompt = buildSystemPrompt(ACCOUNT, "2026-09-19");
+
+  it("bans asserting a cause and supplies the wording to use instead", () => {
+    expect(prompt).toContain("Never assert a cause");
+    expect(prompt).toContain("satış düşüşünün ana sebebi bu");
+    expect(prompt).toContain("satışların nedeni budur");
+    expect(prompt).toContain(
+      "Mevcut veriler içinde satın alma düşüşüyle en güçlü ilişkili sinyal bu görünüyor.",
+    );
+    expect(prompt).toContain(
+      "Mevcut veriler içinde satın alma düşüşüne en güçlü katkı bu faktörde görünüyor.",
+    );
+  });
+
+  it("explains why the wording matters, so the rule is not read as politeness", () => {
+    expect(prompt).toContain("Two metrics moving together is what was measured");
+    // The sentence spans two prompt lines, so the assertion stops at the break.
+    expect(prompt).toContain("reporting something that was");
+    expect(prompt).toContain("never computed");
+  });
+
+  it("bans generalising a metric and requires both values", () => {
+    expect(prompt).toContain("Never generalise a metric into a story");
+    expect(prompt).toContain("daha az trafik geldi");
+    expect(prompt).toContain("Name the metric, both values and the");
+    expect(prompt).toContain("tıklamalar 6.531");
+    expect(prompt).toContain("trafik tarafında");
+  });
+
+  it("bans reading a contribution share as a cause", () => {
+    expect(prompt).toContain("Never read a contribution share as a cause");
+    expect(prompt).toContain("bu kampanyadaki değişimle açıklanıyor");
+    expect(prompt).toContain("it did not cause it");
+  });
+
+  it("still requires the analysis headings and the data-sufficiency line", () => {
+    expect(prompt).toContain("PERFORMANS ANALİZİ");
+    expect(prompt).toContain("ANA SİNYALLER");
+    expect(prompt).toContain("VERİ YETERLİLİĞİ");
+    expect(prompt).toContain("describes the relationship, not a cause");
+  });
+
+  it("keeps the standing rules it was layered on top of", () => {
+    // The language rules are additive; none of them replaced a guard.
+    expect(prompt).toContain("Mevcut Meta verileri kesin");
+    expect(prompt).toContain("do not see a landing page");
+    expect(prompt).toContain("never ranked among the signals");
+  });
+});
