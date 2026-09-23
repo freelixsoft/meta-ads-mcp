@@ -370,3 +370,78 @@ describe("the prompt keeps a diagnosis to what was measured", () => {
     expect(prompt).toContain("never ranked among the signals");
   });
 });
+
+/**
+ * How an ad-level review is allowed to be worded.
+ *
+ * The engine has already separated "kötü" from "kötüleşti" and counted how
+ * many metrics corroborate a decline. These rules stop the answer from putting
+ * them back together: a single CPA spike is not a verdict, a paused ad is not
+ * a bad performer, and "the only ad that got worse" is a claim about every ad
+ * in the account, which a capped list of ten was never going to support.
+ */
+describe("the prompt keeps low performance and a decline apart", () => {
+  const prompt = buildSystemPrompt(ACCOUNT, "2026-09-19");
+
+  it("routes the question to the review tool", () => {
+    expect(prompt).toContain(
+      "'Son 7 günde hangi reklamlar kötü gidiyor?'   -> meta_review_ad_performance (level 'ad')",
+    );
+    expect(prompt).toContain("'Hangi reklamlar kötüleşiyor / düşüşte?'      -> meta_review_ad_performance");
+  });
+
+  it("requires the two sections, and says an ad can be in both", () => {
+    expect(prompt).toContain("ÖNCEKİ DÖNEME GÖRE KÖTÜLEŞENLER");
+    expect(prompt).toContain("MEVCUT DÖNEMDE DÜŞÜK PERFORMANS");
+    expect(prompt).toContain("Never merge them into a single ranking");
+    expect(prompt).toContain("`inBothLists` names the ids in both");
+  });
+
+  it("lists every signal the judgement has to rest on", () => {
+    expect(prompt).toContain(
+      "- Judge on spend, purchases, purchase value, CPA, ROAS, CTR, CPC, CPM, conversion rate, the",
+    );
+    expect(prompt).toContain("previous-period change, data sufficiency and status TOGETHER");
+    expect(prompt).toContain("No single metric decides");
+  });
+
+  it("scales the wording to how many metrics moved", () => {
+    expect(prompt).toContain("CORROBORATION");
+    expect(prompt).toContain("'single' (exactly one) -> stay tentative and SAY it rests on one metric");
+    expect(prompt).toContain("Mevcut veride bu reklam için en belirgin olumsuz sinyal CPA tarafında.");
+    expect(prompt).toContain("birden fazla metrik aynı yönde");
+  });
+
+  it("bans the certainty the old answer reached for", () => {
+    expect(prompt).toContain("bu dönemde gerçekten bozulma gösteren tek reklam");
+    expect(prompt).toContain("tek sorunlu reklam");
+    expect(prompt).toContain("asıl sorun bu");
+    expect(prompt).toContain("'Tek' is a claim about every ad in");
+  });
+
+  it("keeps paused and non-delivering ads out of the performance lists", () => {
+    expect(prompt).toContain("PAUSED AND NON-DELIVERING ADS ARE NOT BAD PERFORMERS");
+    expect(prompt).toContain("never propose pausing");
+    expect(prompt).toContain(
+      "'Bu reklamlar duraklatılmış olduğu için mevcut dönemde aktif performans karşılaştırmasına",
+    );
+  });
+
+  it("separates a strong result from advice about it", () => {
+    expect(prompt).toContain("A STRONG ROAS IS A MEASUREMENT, NOT A CUE TO SPEND MORE");
+    expect(prompt).toContain("6,29 ROAS ile güçlü performans gösteriyor");
+    expect(prompt).toContain("Do not add");
+    expect(prompt).toContain("bütçeyi artırmayı düşünün");
+    expect(prompt).toContain("meta_find_opportunities answers it");
+  });
+
+  it("calls thin data thin rather than bad", () => {
+    expect(prompt).toContain("is 'yetersiz veri', not 'kötü'");
+    expect(prompt).toContain("never inside A or B");
+  });
+
+  it("refuses to fill an empty answer", () => {
+    expect(prompt).toContain("no ad crossed the thresholds in this period");
+    expect(prompt).toContain("Do not promote the least good ad to fill the space");
+  });
+});

@@ -210,7 +210,7 @@ describe("tool definitions handed to Claude", () => {
     }
   });
 
-  it("exposes the eleven read tools and the six write tools", () => {
+  it("exposes the twelve read tools and the six write tools", () => {
     const withWrites = buildToolDefinitions({ allowWrites: true }).map((tool) => tool.name);
     expect(withWrites).toEqual([
       "meta_list_ad_accounts",
@@ -220,6 +220,7 @@ describe("tool definitions handed to Claude", () => {
       "meta_get_insights",
       "meta_compare_periods",
       "meta_find_opportunities",
+      "meta_review_ad_performance",
       "meta_diagnose_change",
       "meta_get_campaign_detail",
       "meta_get_ad_set_detail",
@@ -235,7 +236,7 @@ describe("tool definitions handed to Claude", () => {
 
   it("does not even declare the write tools when writes are off", () => {
     const readOnly = buildToolDefinitions({ allowWrites: false }).map((tool) => tool.name);
-    expect(readOnly).toHaveLength(11);
+    expect(readOnly).toHaveLength(12);
     expect(readOnly.some((name) => name.includes("create") || name.includes("update"))).toBe(false);
   });
 
@@ -663,6 +664,37 @@ describe("write tools — planning never writes", () => {
     expect(cbo?.writeTool).toBeNull();
     expect(String(cbo?.action)).toContain("CBO");
     expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+
+  it("runs the performance review as a read, in two separate lists", async () => {
+    const result = (await run("meta_review_ad_performance", { preset: "last_7d", level: "ad" })) as {
+      level: string;
+      period: { since: string; until: string };
+      previousPeriod: { since: string; until: string };
+      deteriorating: Array<Record<string, unknown>>;
+      underperforming: Array<Record<string, unknown>>;
+      excluded: Array<Record<string, unknown>>;
+      inBothLists: string[];
+      totals: Record<string, number>;
+    };
+
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+    expect(result.level).toBe("ad");
+    expect(result.previousPeriod.until < result.period.since).toBe(true);
+    // Ad 300 is PAUSED in the fixture, so it belongs in neither list.
+    expect(result.excluded.map((entry) => entry.id)).toContain("300");
+    expect(result.deteriorating.map((entry) => entry.id)).not.toContain("300");
+    expect(result.underperforming.map((entry) => entry.id)).not.toContain("300");
+    expect(String(result.excluded[0].exclusionStatement)).toContain("dahil edilmedi");
+    expect(result.inBothLists).toEqual([]);
+  });
+
+  it("reads no campaign budgets for a review, which proposes no budget", async () => {
+    await run("meta_review_ad_performance", { preset: "last_7d", level: "ad" });
+
+    const paths = metaGetPaginatedMock.mock.calls.map((call) => String(call[0]));
+    expect(paths.some((path) => path.endsWith("/ads"))).toBe(true);
+    expect(paths.some((path) => path.endsWith("/campaigns"))).toBe(false);
   });
 
   it("plans an ad against an authorized ad set", async () => {

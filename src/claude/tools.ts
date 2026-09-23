@@ -26,9 +26,10 @@ import {
   getChildRows,
   getEntityInsights,
 } from "../dashboard/services/entity-insights.js";
-import type { CampaignDto, EntityRowDto } from "../dashboard/dto.js";
+import type { CampaignDto, EntityLevel, EntityRowDto } from "../dashboard/dto.js";
 import { analyze } from "./decision-engine.js";
 import { diagnose, type ChildPeriods } from "./diagnosis-engine.js";
+import { reviewPerformance, type ObjectReview } from "./performance-review.js";
 import type { ConfirmationField, ToolExecutionContext } from "./types.js";
 
 /**
@@ -63,6 +64,8 @@ const MAX_FINDINGS = 8;
 
 /** Children returned by the diagnosis, highest share of the change first. */
 const MAX_CONTRIBUTIONS = 10;
+/** Objects returned per list by the performance review, highest spend first. */
+const MAX_REVIEW_ROWS = 10;
 const MAX_ROW_LIMIT = 40;
 
 const limitField = z
@@ -193,6 +196,58 @@ function entitySummary(entity: EntityRef): Record<string, unknown> {
   };
 }
 
+/**
+ * One reviewed object, with the sentences the engine already built.
+ *
+ * The statements travel with the numbers rather than being left for the model
+ * to compose: a single-signal reading is hedged in the string itself, so the
+ * caution survives even if the answer quotes the sentence and nothing else.
+ */
+function toReviewResult(review: ObjectReview): Record<string, unknown> {
+  return {
+    id: review.objectId,
+    name: sanitizeLabel(review.objectName),
+    level: review.level,
+    status: sanitizeLabel(review.status) || "UNKNOWN",
+    campaignName: review.campaignName ? sanitizeLabel(review.campaignName) : null,
+    adSetName: review.adSetName ? sanitizeLabel(review.adSetName) : null,
+    spendShare: review.spendShare,
+    metrics: review.metrics,
+    previousMetrics: review.previousMetrics,
+    dataSufficiency: review.dataSufficiency,
+    dataSufficiencyReason: review.dataSufficiencyReason,
+    trend: review.trend,
+    deteriorationStrength: review.deteriorationStrength,
+    deteriorationSignals: review.deteriorationSignals,
+    improvementSignals: review.improvementSignals,
+    deteriorationPatterns: review.deteriorationPatterns.map((pattern) => pattern.label),
+    deteriorationStatement: review.deteriorationStatement,
+    improvementStatement: review.improvementStatement,
+    weaknesses: review.weaknesses,
+    strong: review.strong,
+    strongStatement: review.strongStatement,
+  };
+}
+
+/** The compact form, for lists where only the reason matters. */
+function briefReview(review: ObjectReview): Record<string, unknown> {
+  return {
+    id: review.objectId,
+    name: sanitizeLabel(review.objectName),
+    status: sanitizeLabel(review.status) || "UNKNOWN",
+    spend: review.metrics.spend,
+    purchases: review.metrics.purchases,
+    excludedBecause: review.excludedBecause,
+    exclusionStatement: review.exclusionStatement,
+    dataSufficiency: review.dataSufficiency,
+    dataSufficiencyReason: review.dataSufficiencyReason,
+  };
+}
+
+function capReviews(reviews: ObjectReview[]): Record<string, unknown>[] {
+  return reviews.slice(0, MAX_REVIEW_ROWS).map(toReviewResult);
+}
+
 /** Metrics Meta returned nothing for, stated rather than left as an ambiguous 0. */
 function missingOf(metrics: Record<string, number | null>): string[] {
   return METRIC_KEYS.filter((key) => metrics[key] === null);
@@ -207,6 +262,84 @@ async function resolveScope(
   if (input.level === "campaign") return authorizeCampaign(tools.ctx, tools.account, id);
   if (input.level === "adset") return authorizeAdSet(tools.ctx, tools.account, id);
   return authorizeAd(tools.ctx, tools.account, id);
+}
+
+interface PeriodPair {
+  /** The period under analysis, as concrete dates. */
+  concrete: { since: string; until: string };
+  /** The previous equivalent window: same length, ending the day before. */
+  before: { since: string; until: string };
+  rows: EntityRowDto[];
+  previousRows: EntityRowDto[];
+  /** Campaigns that hold their own budget (CBO). Empty unless asked for. */
+  cboCampaignIds: Set<string>;
+}
+
+/**
+ * One level of the account over a period AND the previous equivalent one.
+ *
+ * Shared by every analysis tool, so "the previous period" is one rule in one
+ * place rather than a definition each caller re-derives. `budgetOwners` is
+ * opt-in because the campaign read behind it only earns its Meta call when the
+ * caller is going to propose a budget change; a review that describes
+ * performance never does.
+ */
+async function readPeriodPair(
+  tools: ToolExecutionContext,
+  range: ResolvedRange,
+  level: Exclude<EntityLevel, "account">,
+  options: { budgetOwners: boolean },
+): Promise<PeriodPair> {
+  const concrete =
+    range.timeRange ?? resolvePresetDates(range.datePreset ?? "last_30d", tools.account.timezone);
+  const before = previousPeriod(concrete);
+  const previousRange: ResolvedRange = {
+    datePreset: null,
+    timeRange: before,
+    label: "custom",
+    since: before.since,
+    until: before.until,
+  };
+
+  if (level === "campaign") {
+    const [current, prior] = await Promise.all([
+      getCampaignsWithMetrics(tools.ctx, tools.account, range, { status: "ALL" }),
+      getCampaignsWithMetrics(tools.ctx, tools.account, previousRange, { status: "ALL" }),
+    ]);
+    return {
+      concrete,
+      before,
+      rows: current.campaigns.map(campaignRow),
+      previousRows: prior.campaigns.map(campaignRow),
+      cboCampaignIds: new Set(),
+    };
+  }
+
+  const parent = accountEntityRef(tools.account);
+  const children =
+    level === "adset"
+      ? await listAdSetsOfAccount(tools.ctx, tools.account)
+      : await listAdsOfAccount(tools.ctx, tools.account);
+
+  const [current, prior, campaigns] = await Promise.all([
+    getChildRows(tools.ctx, tools.account, parent, level, range, children),
+    getChildRows(tools.ctx, tools.account, parent, level, previousRange, children),
+    options.budgetOwners
+      ? getCampaignsWithMetrics(tools.ctx, tools.account, range, { status: "ALL" })
+      : Promise.resolve(null),
+  ]);
+
+  return {
+    concrete,
+    before,
+    rows: current,
+    previousRows: prior,
+    cboCampaignIds: new Set(
+      (campaigns?.campaigns ?? [])
+        .filter((campaign) => campaign.dailyBudget !== null || campaign.lifetimeBudget !== null)
+        .map((campaign) => campaign.id),
+    ),
+  };
 }
 
 // ─── Read tools ──────────────────────────────────────────────────
@@ -445,52 +578,16 @@ export const READ_TOOLS: ReadTool[] = [
     label: (input) => `Optimizasyon taraması yapıldı (${input.level}, ${input.preset})`,
     async run(input, tools) {
       const range = resolveRange(input);
-      const parent = accountEntityRef(tools.account);
       const level = input.level;
 
-      // The previous window is the same rule the comparison uses everywhere
-      // else: same length, ending the day before this one starts.
-      const concrete = range.timeRange ?? resolvePresetDates(range.datePreset ?? "last_30d", tools.account.timezone);
-      const before = previousPeriod(concrete);
-      const previousRange: ResolvedRange = {
-        datePreset: null,
-        timeRange: before,
-        label: "custom",
-        since: before.since,
-        until: before.until,
-      };
-
-      let rows: EntityRowDto[];
-      let previousRows: EntityRowDto[];
-      let cboCampaignIds = new Set<string>();
-
-      if (level === "campaign") {
-        const [current, prior] = await Promise.all([
-          getCampaignsWithMetrics(tools.ctx, tools.account, range, { status: "ALL" }),
-          getCampaignsWithMetrics(tools.ctx, tools.account, previousRange, { status: "ALL" }),
-        ]);
-        rows = current.campaigns.map(campaignRow);
-        previousRows = prior.campaigns.map(campaignRow);
-      } else {
-        const children =
-          level === "adset"
-            ? await listAdSetsOfAccount(tools.ctx, tools.account)
-            : await listAdsOfAccount(tools.ctx, tools.account);
-        // Campaign budgets decide whether an ad-set budget recommendation is
-        // even expressible: under CBO it is not.
-        const [current, prior, campaigns] = await Promise.all([
-          getChildRows(tools.ctx, tools.account, parent, level, range, children),
-          getChildRows(tools.ctx, tools.account, parent, level, previousRange, children),
-          getCampaignsWithMetrics(tools.ctx, tools.account, range, { status: "ALL" }),
-        ]);
-        rows = current;
-        previousRows = prior;
-        cboCampaignIds = new Set(
-          campaigns.campaigns
-            .filter((campaign) => campaign.dailyBudget !== null || campaign.lifetimeBudget !== null)
-            .map((campaign) => campaign.id),
-        );
-      }
+      // Campaign budgets decide whether an ad-set budget recommendation is
+      // even expressible: under CBO it is not.
+      const { concrete, before, rows, previousRows, cboCampaignIds } = await readPeriodPair(
+        tools,
+        range,
+        level,
+        { budgetOwners: true },
+      );
 
       const previousById = new Map(previousRows.map((row) => [row.id, row.metrics]));
       const result = analyze({ level, currency: tools.account.currency, rows, previousById, cboCampaignIds });
@@ -511,6 +608,66 @@ export const READ_TOOLS: ReadTool[] = [
           adSetName: finding.adSetName ? sanitizeLabel(finding.adSetName) : null,
         })),
         totalFindings: result.findings.length,
+      };
+    },
+  }),
+
+  readTool({
+    name: "meta_review_ad_performance",
+    description:
+      "Which objects are performing badly, split into the two questions that get confused with each other: (A) deteriorating — materially worse than the previous equivalent period, with every metric that moved the wrong way and whether more than one corroborates it; (B) underperforming — weak in the CURRENT period against the account's own ROAS and cost per purchase, whichever way it is moving. Also returns the ones performing above the account average, the ones with too little spend or too few purchases to judge, and the paused / non-delivering ones that were left out of both lists with the reason. Use it for 'hangi reklamlar kötü gidiyor', 'hangi reklamlar kötüleşiyor', 'son 7 günde ne bozuldu', 'hangi reklamlar düşüşte'. It carries no action, no budget and no recommendation by design — ask meta_find_opportunities for those. It changes nothing.",
+    schema: z
+      .object({
+        ...rangeFields,
+        level: z
+          .enum(["campaign", "adset", "ad"])
+          .default("ad")
+          .describe("Which level to review. Default 'ad'."),
+      })
+      .superRefine(checkRange),
+    label: (input) => `Performans incelemesi yapıldı (${input.level}, ${input.preset})`,
+    async run(input, tools) {
+      const range = resolveRange(input);
+      const { concrete, before, rows, previousRows } = await readPeriodPair(
+        tools,
+        range,
+        input.level,
+        // A review describes performance; it never proposes a budget, so the
+        // campaign read that answers "who owns the budget" is not needed.
+        { budgetOwners: false },
+      );
+
+      const previousById = new Map(previousRows.map((row) => [row.id, row.metrics]));
+      const result = reviewPerformance({
+        level: input.level,
+        currency: tools.account.currency,
+        rows,
+        previousById,
+      });
+
+      return {
+        account: { name: sanitizeLabel(tools.account.name), currency: tools.account.currency },
+        level: input.level,
+        period: { preset: range.label, since: concrete.since, until: concrete.until },
+        previousPeriod: before,
+        baselines: result.baselines,
+        counts: result.counts,
+        metricsMissingOnEveryRow: result.metricsMissingOnEveryRow,
+        deteriorating: capReviews(result.deteriorating),
+        underperforming: capReviews(result.underperforming),
+        strong: capReviews(result.strong),
+        insufficientData: result.insufficientData.slice(0, MAX_REVIEW_ROWS).map(briefReview),
+        excluded: result.excluded.slice(0, MAX_REVIEW_ROWS).map(briefReview),
+        // Named explicitly: the two lists are views onto the same rows, and an
+        // answer that presents them as mutually exclusive is wrong.
+        inBothLists: result.overlap,
+        totals: {
+          deteriorating: result.deteriorating.length,
+          underperforming: result.underperforming.length,
+          strong: result.strong.length,
+          insufficientData: result.insufficientData.length,
+          excluded: result.excluded.length,
+        },
       };
     },
   }),

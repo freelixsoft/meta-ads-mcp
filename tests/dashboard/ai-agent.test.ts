@@ -217,7 +217,7 @@ describe("the read path", () => {
   it("declares the tools on every request so the model can drill down", async () => {
     configureClaudeClientForTests(scriptedClient([text("Merhaba.")]));
     await ask();
-    expect(sentRequests[0].tools?.length).toBe(17);
+    expect(sentRequests[0].tools?.length).toBe(18);
     expect(sentRequests[0].system).toContain("Acme TR");
   });
 });
@@ -433,7 +433,7 @@ describe("the write path", () => {
 
     const result = await ask("kampanyayı durdur", false);
 
-    expect(sentRequests[0].tools?.length).toBe(11);
+    expect(sentRequests[0].tools?.length).toBe(12);
     expect(result.pendingConfirmation).toBeNull();
     expect(pendingWriteCount()).toBe(0);
     expect(result.toolTrace[0]).toMatchObject({ status: "error", errorCode: "writes_disabled" });
