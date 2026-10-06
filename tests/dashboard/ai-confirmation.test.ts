@@ -448,3 +448,168 @@ describe("applyDashboardConfirmation", () => {
     );
   });
 });
+
+/**
+ * The verification reads, per level.
+ *
+ * An ad has no budget of its own, and Meta fails a whole call that names a
+ * field the node does not have rather than answering with a null. Because the
+ * staleness read runs *before* the write is built, one field list shared by all
+ * three levels meant every ad-level write died without a single POST reaching
+ * Meta — observed in production as a pause on an ad answered with
+ * "(#100) Tried accessing nonexisting field (daily_budget)".
+ *
+ * `adNodeGet` therefore refuses budget fields the way Meta does, so these tests
+ * fail against that bug instead of quietly returning whatever the code asked
+ * for. The plan fixtures mirror what the real `meta_update_ad` and
+ * `meta_update_ad_set` tools build; ai-hierarchy.test.ts and ai-tools.test.ts
+ * pin that output.
+ */
+describe("the fields read back to verify a write", () => {
+  const AD_FIELDS = "id,name,status,effective_status";
+  const BUDGET_FIELDS = "id,name,status,effective_status,daily_budget,lifetime_budget";
+
+  function adNodeGet(overrides: Record<string, unknown> = {}) {
+    return (_path: unknown, params: unknown) => {
+      const fields = String((params as { fields?: string } | undefined)?.fields ?? "");
+      const missing = ["daily_budget", "lifetime_budget"].find((field) => fields.includes(field));
+      if (missing) {
+        return Promise.reject(
+          new Error(`Invalid parameter: (#100) Tried accessing nonexisting field (${missing})`),
+        );
+      }
+      return Promise.resolve({
+        id: "700",
+        name: "B2",
+        status: "ACTIVE",
+        effective_status: "ACTIVE",
+        ...overrides,
+      });
+    };
+  }
+
+  function adPausePlan(overrides: Partial<WritePlan> = {}): WritePlan {
+    return {
+      tool: "meta_update_ad",
+      title: "Reklam güncellenecek",
+      description: "Onaylarsanız bu değişiklik Meta'ya gönderilir.",
+      reason: "B2 son 7 günde dönüşüm getirmedi.",
+      risk: null,
+      confidence: null,
+      fields: [{ label: "Reklam", value: "B2" }],
+      path: "/700",
+      body: { status: "PAUSED" },
+      expected: { status: "ACTIVE" },
+      verify: { kind: "existing", id: "700", level: "ad" },
+      ...overrides,
+    };
+  }
+
+  function adSetPausePlan(): WritePlan {
+    return adPausePlan({
+      tool: "meta_update_ad_set",
+      title: "Reklam seti güncellenecek",
+      fields: [{ label: "Reklam seti", value: "Retargeting 18-35" }],
+      path: "/500",
+      verify: { kind: "existing", id: "500", level: "adset" },
+    });
+  }
+
+  /** Every field list this plan asked Meta for, in call order. */
+  function requestedFields(): string[] {
+    return metaGetMock.mock.calls.map((call) => String((call[1] as { fields?: string }).fields));
+  }
+
+  it("never asks an ad for budget fields it does not have", async () => {
+    metaGetMock.mockImplementation(adNodeGet());
+
+    const result = await applyDashboardConfirmation(CTX, ACCOUNT, stage(adPausePlan()).id);
+
+    // The staleness read comes first, and it is the one the bug killed.
+    expect(metaGetMock.mock.calls[0]).toEqual(["/700", { fields: AD_FIELDS }]);
+    // The read-back after the write is the same node, so it is asked the same.
+    expect(requestedFields()).toEqual([AD_FIELDS, AD_FIELDS]);
+    for (const fields of requestedFields()) {
+      expect(fields).not.toContain("daily_budget");
+      expect(fields).not.toContain("lifetime_budget");
+    }
+    // Which means the write went through and was verified, not merely attempted.
+    expect(result).toMatchObject({ applied: true, verificationFailed: false });
+    // An ad has no budget to report, at either level of the response.
+    expect(result.verified.dailyBudget).toBeNull();
+    expect(result.verified.lifetimeBudget).toBeNull();
+  });
+
+  it("sends the approved pause to the ad, unchanged", async () => {
+    metaGetMock.mockImplementation(adNodeGet());
+
+    await applyDashboardConfirmation(CTX, ACCOUNT, stage(adPausePlan()).id);
+
+    expect(metaPostFormMock).toHaveBeenCalledTimes(1);
+    expect(metaPostFormMock).toHaveBeenCalledWith("/700", { status: "PAUSED" });
+  });
+
+  it("still asks a campaign and an ad set for their budgets", async () => {
+    await applyDashboardConfirmation(CTX, ACCOUNT, stage().id);
+    expect(metaGetMock.mock.calls[0]).toEqual(["/100", { fields: BUDGET_FIELDS }]);
+    expect(requestedFields()).toEqual([BUDGET_FIELDS, BUDGET_FIELDS]);
+
+    metaGetMock.mockClear();
+    await applyDashboardConfirmation(CTX, ACCOUNT, stage(adSetPausePlan()).id);
+    expect(metaGetMock.mock.calls[0]).toEqual(["/500", { fields: BUDGET_FIELDS }]);
+    expect(requestedFields()).toEqual([BUDGET_FIELDS, BUDGET_FIELDS]);
+  });
+
+  it("still refuses an ad-level write over a status someone else already changed", async () => {
+    // Somebody paused B2 in Ads Manager between the proposal and the approval.
+    metaGetMock.mockImplementation(adNodeGet({ status: "PAUSED" }));
+
+    await expect(
+      applyDashboardConfirmation(CTX, ACCOUNT, stage(adPausePlan()).id),
+    ).rejects.toMatchObject({ code: "ai_write_stale", status: 409 });
+
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+    const entries = await getAuditLog().list(CTX.fbUserId);
+    expect(entries[0]).toMatchObject({
+      outcome: "refused_stale",
+      tool: "meta_update_ad",
+      objectId: "700",
+      before: { status: "ACTIVE" },
+      after: { status: "PAUSED" },
+    });
+  });
+
+  it("sends nothing to an ad without an approval, and honours the kill switch", async () => {
+    metaGetMock.mockImplementation(adNodeGet());
+
+    // Staging alone reaches neither the read nor the write.
+    const confirmation = stage(adPausePlan());
+    expect(metaGetMock).not.toHaveBeenCalled();
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+
+    // An id nobody staged cannot stand in for the approval.
+    await expect(
+      applyDashboardConfirmation(CTX, ACCOUNT, "00000000-0000-0000-0000-000000000000"),
+    ).rejects.toMatchObject({ code: "ai_confirmation_expired" });
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+
+    process.env.DASHBOARD_AI_WRITES = "off";
+    await expect(applyDashboardConfirmation(CTX, ACCOUNT, confirmation.id)).rejects.toMatchObject({
+      code: "ai_writes_disabled",
+      status: 403,
+    });
+    expect(metaGetMock).not.toHaveBeenCalled();
+    expect(metaPostFormMock).not.toHaveBeenCalled();
+  });
+
+  it("is used once per approval, at ad level too", async () => {
+    metaGetMock.mockImplementation(adNodeGet());
+    const confirmation = stage(adPausePlan());
+
+    await applyDashboardConfirmation(CTX, ACCOUNT, confirmation.id);
+    await expect(applyDashboardConfirmation(CTX, ACCOUNT, confirmation.id)).rejects.toMatchObject({
+      code: "ai_confirmation_expired",
+    });
+    expect(metaPostFormMock).toHaveBeenCalledTimes(1);
+  });
+});

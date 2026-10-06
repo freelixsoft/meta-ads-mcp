@@ -1507,7 +1507,24 @@ export const WRITE_TOOLS: WriteTool[] = [
 
 // ─── Execution of an approved plan ───────────────────────────────
 
-const VERIFY_FIELDS = "id,name,status,effective_status,daily_budget,lifetime_budget";
+/**
+ * The fields read back to confirm a write, chosen by the level being written.
+ *
+ * An ad has no budget of its own — budgets live on the ad set, or on the
+ * campaign when it uses CBO — and Meta answers a request for a field a node
+ * does not have with "(#100) Tried accessing nonexisting field (daily_budget)"
+ * rather than with a null. Asking for the same six fields at every level
+ * therefore broke every ad-level write: the staleness read below runs before
+ * the write is built, so a pause on an ad failed without a single POST ever
+ * being sent. AD_REF_FIELDS in src/dashboard/services/entities.ts already
+ * draws this line for the authorization read; this keeps the verification read
+ * in step with it.
+ */
+const VERIFY_FIELDS: Record<WritePlan["verify"]["level"], string> = {
+  campaign: "id,name,status,effective_status,daily_budget,lifetime_budget",
+  adset: "id,name,status,effective_status,daily_budget,lifetime_budget",
+  ad: "id,name,status,effective_status",
+};
 
 /**
  * Send an approved plan to Meta, then read the object back.
@@ -1563,7 +1580,7 @@ export async function applyWritePlan(plan: WritePlan): Promise<{
   // exists — so a mismatch stops here, before anything is sent.
   if (plan.verify.kind === "existing" && plan.verify.id && Object.keys(plan.expected).length > 0) {
     const current = await metaApiClient.get<Record<string, unknown>>(`/${plan.verify.id}`, {
-      fields: VERIFY_FIELDS,
+      fields: VERIFY_FIELDS[plan.verify.level],
     });
     const drift = driftOf(plan.expected, current);
     if (drift) throw new StaleWriteError(drift.field, drift.approved, drift.current);
@@ -1574,7 +1591,9 @@ export async function applyWritePlan(plan: WritePlan): Promise<{
   if (!id) return { id: null, verified: {}, verificationFailed: true };
 
   try {
-    const fresh = await metaApiClient.get<Record<string, unknown>>(`/${id}`, { fields: VERIFY_FIELDS });
+    const fresh = await metaApiClient.get<Record<string, unknown>>(`/${id}`, {
+      fields: VERIFY_FIELDS[plan.verify.level],
+    });
     return {
       id,
       verified: {
