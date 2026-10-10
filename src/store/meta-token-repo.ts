@@ -264,7 +264,10 @@ export class FirestoreMetaTokenRepo implements MetaTokenRepo {
       await this.clearDefaults(input.fbUserId);
     } else {
       const existingDefault = await this.getDefaultTokenName(input.fbUserId);
-      if (!existingDefault) {
+      // The set() below replaces the whole doc, so re-saving the token that
+      // currently holds the default would write isDefault: false over its own
+      // flag and leave the user with no default at all.
+      if (!existingDefault || existingDefault === input.name) {
         doc.isDefault = true;
       }
     }
@@ -397,7 +400,8 @@ export class InMemoryMetaTokenRepo implements MetaTokenRepo {
       }
     } else {
       const existingDefault = await this.getDefaultTokenName(input.fbUserId);
-      if (!existingDefault) {
+      // Mirrors the Firestore repo: re-saving the current default must keep it.
+      if (!existingDefault || existingDefault === input.name) {
         isDefault = true;
       }
     }

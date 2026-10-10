@@ -1,10 +1,26 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { Firestore } from "@google-cloud/firestore";
 import { resetKeyCacheForTests } from "../../src/auth/crypto.js";
 import {
+  FirestoreMetaTokenRepo,
   InMemoryMetaTokenRepo,
+  type MetaTokenDoc,
   type MetaTokenRepo,
 } from "../../src/store/meta-token-repo.js";
 import * as metaOAuth from "../../src/auth/meta-oauth.js";
+
+// FirestoreMetaTokenRepo reaches the database only through getFirestore(),
+// so swapping that single function is enough to drive the real production
+// class against an in-memory double. Nothing here contacts Google.
+const { firestoreHolder } = vi.hoisted(() => ({
+  firestoreHolder: { db: null as unknown as Firestore },
+}));
+
+vi.mock("../../src/store/firestore.js", () => ({
+  getFirestore: () => firestoreHolder.db,
+  isFirestoreEnabled: () => true,
+  resetFirestoreForTests: () => {},
+}));
 
 const ENCRYPTION_KEY = "a".repeat(64);
 const APP_ID = "test-app";
@@ -81,6 +97,50 @@ describe("InMemoryMetaTokenRepo", () => {
     const tokens = await repo.listTokens("fb-1");
     expect(tokens.find((t) => t.name === "a")?.isDefault).toBe(false);
     expect(tokens.find((t) => t.name === "b")?.isDefault).toBe(true);
+  });
+
+  it("re-saving the token that holds the default keeps it default", async () => {
+    await repo.saveToken(makeInput({ name: "personal" }));
+    expect(await repo.getDefaultTokenName("fb-1")).toBe("personal");
+
+    // A second Meta login: the callback sees a default already exists and so
+    // passes setAsDefault=false, but the doc it overwrites IS that default.
+    // Before the fix this wrote isDefault: false over the only default and
+    // POST /authorize answered "No hay token de Meta conectado".
+    await repo.saveToken(makeInput({ name: "personal", setAsDefault: false }));
+
+    expect(await repo.getDefaultTokenName("fb-1")).toBe("personal");
+    const tokens = await repo.listTokens("fb-1");
+    expect(tokens).toHaveLength(1);
+    expect(tokens[0]).toMatchObject({ name: "personal", isDefault: true });
+  });
+
+  it("re-saving a non-default token leaves another token's default alone", async () => {
+    await repo.saveToken(
+      makeInput({ name: "byads", kind: "system_user", expiresAt: null }),
+    );
+    await repo.saveToken(makeInput({ name: "personal" }));
+    expect(await repo.getDefaultTokenName("fb-1")).toBe("byads");
+
+    await repo.saveToken(makeInput({ name: "personal", setAsDefault: false }));
+
+    expect(await repo.getDefaultTokenName("fb-1")).toBe("byads");
+    const tokens = await repo.listTokens("fb-1");
+    expect(tokens.find((t) => t.name === "byads")?.isDefault).toBe(true);
+    expect(tokens.find((t) => t.name === "personal")?.isDefault).toBe(false);
+  });
+
+  it("selects a default on save when none exists and allows switching after", async () => {
+    expect(await repo.getDefaultTokenName("fb-1")).toBeNull();
+
+    await repo.saveToken(makeInput({ name: "personal" }));
+    expect(await repo.getDefaultTokenName("fb-1")).toBe("personal");
+
+    await repo.saveToken(
+      makeInput({ name: "byads", kind: "system_user", expiresAt: null }),
+    );
+    expect(await repo.setDefaultToken("fb-1", "byads")).toBe(true);
+    expect(await repo.getDefaultTokenName("fb-1")).toBe("byads");
   });
 
   it("setDefaultToken returns false when missing and switches when present", async () => {
@@ -230,5 +290,233 @@ describe("InMemoryMetaTokenRepo", () => {
 
     expect(await repo.setDefaultToken("fb-1", "byads")).toBe(true);
     expect(await repo.getDecryptedToken("fb-1")).toBe("byads-token");
+  });
+});
+
+type DocData = Record<string, unknown>;
+
+/**
+ * Minimal stand-in for the slice of the Firestore API FirestoreMetaTokenRepo
+ * actually calls. Documents live in one flat map keyed by full path, which
+ * covers the nesting the repo does, and the two write semantics the
+ * default-flag logic depends on are modelled the way Firestore behaves:
+ * set() without merge replaces the whole document, update() merges into it.
+ * Getting that pair wrong would make these tests pass vacuously, so
+ * "reproduces the production bug once the fix is reverted" is part of the
+ * contract this double has to satisfy.
+ */
+class FakeFirestore {
+  readonly docs = new Map<string, DocData>();
+
+  collection(path: string): FakeCollection {
+    return new FakeCollection(this, path);
+  }
+
+  batch() {
+    const ops: Array<() => void> = [];
+    return {
+      update: (ref: FakeDoc, data: DocData) => {
+        ops.push(() => ref.applyMerge(data));
+      },
+      commit: async () => {
+        for (const op of ops) op();
+      },
+    };
+  }
+}
+
+class FakeCollection {
+  constructor(
+    private readonly db: FakeFirestore,
+    private readonly path: string,
+    private readonly filters: Array<[string, unknown]> = [],
+    private readonly max: number | null = null,
+  ) {}
+
+  doc(id: string): FakeDoc {
+    return new FakeDoc(this.db, `${this.path}/${id}`);
+  }
+
+  where(field: string, op: string, value: unknown): FakeCollection {
+    if (op !== "==") throw new Error(`fake supports only "==", got ${op}`);
+    return new FakeCollection(
+      this.db,
+      this.path,
+      [...this.filters, [field, value]],
+      this.max,
+    );
+  }
+
+  limit(n: number): FakeCollection {
+    return new FakeCollection(this.db, this.path, this.filters, n);
+  }
+
+  async get() {
+    const prefix = `${this.path}/`;
+    let entries = [...this.db.docs.entries()].filter(
+      ([key]) =>
+        key.startsWith(prefix) && !key.slice(prefix.length).includes("/"),
+    );
+    for (const [field, value] of this.filters) {
+      entries = entries.filter(([, data]) => data[field] === value);
+    }
+    if (this.max !== null) entries = entries.slice(0, this.max);
+    const docs = entries.map(([key, data]) => ({
+      id: key.slice(prefix.length),
+      ref: new FakeDoc(this.db, key),
+      data: () => structuredClone(data),
+    }));
+    return { docs, empty: docs.length === 0, size: docs.length };
+  }
+}
+
+class FakeDoc {
+  constructor(
+    private readonly db: FakeFirestore,
+    readonly path: string,
+  ) {}
+
+  get id(): string {
+    return this.path.slice(this.path.lastIndexOf("/") + 1);
+  }
+
+  collection(sub: string): FakeCollection {
+    return new FakeCollection(this.db, `${this.path}/${sub}`);
+  }
+
+  async get() {
+    const data = this.db.docs.get(this.path);
+    return {
+      exists: data !== undefined,
+      id: this.id,
+      data: () => (data === undefined ? undefined : structuredClone(data)),
+    };
+  }
+
+  async set(data: DocData, options?: { merge?: boolean }) {
+    if (options?.merge) this.applyMerge(data);
+    else this.db.docs.set(this.path, structuredClone(data));
+  }
+
+  async update(data: DocData) {
+    if (!this.db.docs.has(this.path)) {
+      throw new Error(`NOT_FOUND: no document to update at ${this.path}`);
+    }
+    this.applyMerge(data);
+  }
+
+  async delete() {
+    this.db.docs.delete(this.path);
+  }
+
+  applyMerge(data: DocData) {
+    const current = this.db.docs.get(this.path) ?? {};
+    this.db.docs.set(this.path, { ...current, ...structuredClone(data) });
+  }
+}
+
+describe("FirestoreMetaTokenRepo against a Firestore double", () => {
+  let db: FakeFirestore;
+  let repo: FirestoreMetaTokenRepo;
+  const originalKey = process.env.TOKEN_ENCRYPTION_KEY;
+
+  const stored = (name: string): MetaTokenDoc =>
+    db.docs.get(`users/fb-1/meta_tokens/${name}`) as unknown as MetaTokenDoc;
+
+  beforeEach(() => {
+    process.env.TOKEN_ENCRYPTION_KEY = ENCRYPTION_KEY;
+    resetKeyCacheForTests();
+    db = new FakeFirestore();
+    firestoreHolder.db = db as unknown as Firestore;
+    repo = new FirestoreMetaTokenRepo();
+  });
+
+  afterEach(() => {
+    if (originalKey === undefined) delete process.env.TOKEN_ENCRYPTION_KEY;
+    else process.env.TOKEN_ENCRYPTION_KEY = originalKey;
+    resetKeyCacheForTests();
+  });
+
+  it("the double replaces documents on set(), the way Firestore does", async () => {
+    const ref = db.collection("users").doc("fb-1");
+    await ref.set({ a: 1, b: 2 });
+    await ref.set({ a: 9 });
+    expect((await ref.get()).data()).toEqual({ a: 9 });
+
+    await ref.update({ b: 3 });
+    expect((await ref.get()).data()).toEqual({ a: 9, b: 3 });
+  });
+
+  it("selects the first saved token as the default", async () => {
+    expect(await repo.getDefaultTokenName("fb-1")).toBeNull();
+
+    await repo.saveToken(makeInput({ name: "personal" }));
+
+    expect(await repo.getDefaultTokenName("fb-1")).toBe("personal");
+    expect(stored("personal").isDefault).toBe(true);
+  });
+
+  it("re-saving the token that holds the default keeps it default", async () => {
+    await repo.saveToken(makeInput({ name: "personal" }));
+    expect(await repo.getDefaultTokenName("fb-1")).toBe("personal");
+
+    // The second Meta login, driven the way auth-routes.ts drives it.
+    await repo.saveToken(
+      makeInput({
+        name: "personal",
+        setAsDefault: !(await repo.getDefaultTokenName("fb-1")),
+      }),
+    );
+
+    expect(await repo.getDefaultTokenName("fb-1")).toBe("personal");
+    expect(stored("personal").isDefault).toBe(true);
+    const tokens = await repo.listTokens("fb-1");
+    expect(tokens).toHaveLength(1);
+    expect(tokens[0]).toMatchObject({ name: "personal", isDefault: true });
+  });
+
+  it("leaves another token's default alone when a second token is saved", async () => {
+    await repo.saveToken(
+      makeInput({ name: "byads", kind: "system_user", expiresAt: null }),
+    );
+    expect(await repo.getDefaultTokenName("fb-1")).toBe("byads");
+
+    await repo.saveToken(
+      makeInput({
+        name: "personal",
+        setAsDefault: !(await repo.getDefaultTokenName("fb-1")),
+      }),
+    );
+
+    expect(await repo.getDefaultTokenName("fb-1")).toBe("byads");
+    expect(stored("byads").isDefault).toBe(true);
+    expect(stored("personal").isDefault).toBe(false);
+  });
+
+  it("still swaps the default when setAsDefault is explicit", async () => {
+    await repo.saveToken(makeInput({ name: "personal" }));
+    await repo.saveToken(
+      makeInput({
+        name: "byads",
+        kind: "system_user",
+        expiresAt: null,
+        setAsDefault: true,
+      }),
+    );
+
+    expect(await repo.getDefaultTokenName("fb-1")).toBe("byads");
+    expect(stored("personal").isDefault).toBe(false);
+    expect(stored("byads").isDefault).toBe(true);
+  });
+
+  it("stores the token encrypted and round-trips it", async () => {
+    await repo.saveToken(
+      makeInput({ name: "personal", accessToken: "plaintext-fixture" }),
+    );
+
+    expect(JSON.stringify(stored("personal"))).not.toContain(
+      "plaintext-fixture",
+    );
+    expect(await repo.getDecryptedToken("fb-1")).toBe("plaintext-fixture");
   });
 });
